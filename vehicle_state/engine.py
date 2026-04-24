@@ -1,0 +1,95 @@
+from vehicle_state.matcher import find_nearest_segment, project_point_on_segment
+from vehicle_state.matcher import haversine_distance
+from vehicle_state.movement import determine_movement_state
+from vehicle_state.movement import determine_direction
+from vehicle_state.utils import stabilize_progress
+from vehicle_state.utils import determine_confidence
+def process_observation(observation, previous_state, route_reference):
+
+    # 1️⃣ Extract GPS
+    lat = observation["location"]["lat"]
+    lon = observation["location"]["lon"]
+
+    # 2️⃣ Find nearest segment
+    segment = find_nearest_segment(lat, lon, route_reference["segments"])
+    
+    segments = route_reference["segments"]
+    segment_index = segments.index(segment)
+    total_segments = len(segments)
+    
+
+    # 3️⃣ Project onto segment
+    start = segment["start"]
+    end = segment["end"]
+
+    proj_lat, proj_lon, t = project_point_on_segment(
+        lat, lon,
+        start["lat"], start["lon"],
+        end["lat"], end["lon"]
+    )
+# AFTER projection
+    raw_progress = (segment_index + t) / total_segments
+
+    route_progress = stabilize_progress(
+    raw_progress,
+    previous_state
+)
+# 3.5️⃣ Determine next stop
+    next_stop_id = end["stop_id"]
+# Calculate Distance to next stop
+    distance = haversine_distance(
+    proj_lat, proj_lon,
+    end["lat"], end["lon"]
+)
+#Movement State
+    movement_state = determine_movement_state(
+    distance,
+    observation["speed"],
+    previous_state
+)
+    direction = determine_direction(
+    route_progress,
+    previous_state
+)
+    current_stop_id = None
+
+    if movement_state == "at_stop":
+        current_stop_id = next_stop_id
+
+    confidence = determine_confidence(observation)
+# 4️⃣ Build vehicle state
+    vehicle_state = {   
+        "vehicle_id": observation["vehicle_id"],
+        "route_id": route_reference["route_id"],
+        "trip_id": None,
+        "timestamp": observation["timestamp"],
+
+        "matched_position": {
+            "lat": proj_lat,
+            "lon": proj_lon
+        },
+
+        "current_stop_id": current_stop_id,
+        "next_stop_id": next_stop_id,
+        "stop_sequence": end["sequence"],
+
+        "segment_id": segment["segment_id"],
+        "segment_progress": t,
+        "progress": route_progress,
+
+        "distance_to_next_stop": distance,
+
+        "speed": observation["speed"],
+        "direction": direction,
+
+        "movement": "moving" if observation["speed"] > 0 else "stopped",
+        "movement_state": movement_state,
+
+        "current_delay": 0,
+        "confidence": confidence,
+
+        "source": observation["source"],
+        "simulation_flag": observation["simulation_flag"]
+    }
+
+    return vehicle_state
