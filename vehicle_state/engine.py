@@ -4,6 +4,7 @@ from vehicle_state.movement import determine_movement_state
 from vehicle_state.movement import determine_direction
 from vehicle_state.utils import stabilize_progress
 from vehicle_state.utils import determine_confidence
+from vehicle_state.validation import validate_vehicle_state
 def process_observation(observation, previous_state, route_reference):
 
     # 1️⃣ Extract GPS
@@ -91,5 +92,10 @@ def process_observation(observation, previous_state, route_reference):
         "source": observation["source"],
         "simulation_flag": observation["simulation_flag"]
     }
+
+    vehicle_state = validate_vehicle_state(
+    vehicle_state,
+    previous_state
+)
 
     return vehicle_state

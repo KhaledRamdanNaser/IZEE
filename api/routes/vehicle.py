@@ -3,7 +3,7 @@ from vehicle_state.engine import process_observation
 from reference.loader import load_route_reference
 from database.connection import SessionLocal
 from models.vehicle_live_state import VehicleLiveState
-
+from event_engine.engine import process_event #new
 router = APIRouter()
 
 # load route once (for now)
@@ -28,7 +28,8 @@ def receive_vehicle_location(observation: dict):
     if db_state:
         previous_state = {
             "progress": db_state.progress,
-            "movement_state": db_state.movement_state
+            "movement_state": db_state.movement_state,
+            "next_stop_id": db_state.next_stop_id
         }
 
     # Process observation using the vehicle state engine
@@ -37,7 +38,8 @@ def receive_vehicle_location(observation: dict):
         previous_state,
         route_reference
     )
-
+    events = process_event(current_state=state, previous_state=previous_state)
+    print("EVENTS:", events)
     if db_state:
         # If the vehicle already exists in the database, update the existing record
         db_state.route_id = state["route_id"]
@@ -94,3 +96,66 @@ def receive_vehicle_location(observation: dict):
 
     # Return the current vehicle state as the response
     return state
+
+
+
+
+from fastapi import Query
+
+@router.get("/vehicles/live")
+def get_live_vehicles(
+    vehicle_id: str = Query(default=None),
+    route_id: str = Query(default=None)
+):
+    db = SessionLocal()
+
+    query = db.query(VehicleLiveState)
+
+    # Apply filters
+    if vehicle_id:
+        query = query.filter(VehicleLiveState.vehicle_id == vehicle_id)
+
+    if route_id:
+        query = query.filter(VehicleLiveState.route_id == route_id)
+
+    vehicles = query.all()
+
+    result = []
+
+    for v in vehicles:
+        result.append({
+            "vehicle_id": v.vehicle_id,
+            "route_id": v.route_id,
+            "timestamp": v.timestamp,
+
+            "matched_position": {
+                "lat": v.matched_lat,
+                "lon": v.matched_lon
+            },
+
+            "current_stop_id": v.current_stop_id,
+            "next_stop_id": v.next_stop_id,
+            "stop_sequence": v.stop_sequence,
+
+            "segment_id": v.segment_id,
+            "segment_progress": v.segment_progress,
+            "progress": v.progress,
+
+            "distance_to_next_stop": v.distance_to_next_stop,
+
+            "speed": v.speed,
+            "direction": v.direction,
+
+            "movement": v.movement,
+            "movement_state": v.movement_state,
+
+            "current_delay": v.current_delay,
+            "confidence": v.confidence,
+
+            "source": v.source,
+            "simulation_flag": v.simulation_flag
+        })
+
+    db.close()
+
+    return result

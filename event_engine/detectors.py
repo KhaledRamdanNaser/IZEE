@@ -1,0 +1,27 @@
+# event_engine/detectors.py
+
+def detect_stop_events(current_state, previous_state):
+    """
+    Detect stop arrival and departure events
+    """
+
+    events = []
+
+    prev_state = previous_state.get("movement_state")
+    curr_state = current_state.get("movement_state")
+
+    # Stop Arrival
+    if prev_state != "at_stop" and curr_state == "at_stop":
+        events.append({
+            "event_type": "stop_arrival",
+            "stop_id": current_state.get("next_stop_id")
+        })
+
+    # Stop Departure
+    if prev_state == "at_stop" and curr_state != "at_stop":
+        events.append({
+            "event_type": "stop_departure",
+            "stop_id": previous_state.get("next_stop_id")
+        })
+
+    return events
