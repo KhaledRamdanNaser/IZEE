@@ -2,7 +2,7 @@
 
 from event_engine.detectors import detect_stop_events
 from event_engine.builder import build_event
-
+from event_engine.detectors import detect_stop_events, detect_segment_transition
 
 def process_event(current_state, previous_state):
     """
@@ -22,12 +22,19 @@ def process_event(current_state, previous_state):
     if not previous_state:
         return events
 
-    # 1. Detect stop-related events (arrival/departure)
+  
+    # 1. Detect stop events
     stop_events = detect_stop_events(current_state, previous_state)
 
-    # 2. Build full event objects
-    for event in stop_events:
-        full_event = build_event(event, current_state)
-        events.append(full_event)
+    # 2. Detect segment transitions
+    segment_events = detect_segment_transition(current_state, previous_state)
+
+    # 3. Combine all raw events
+    all_raw_events = stop_events + segment_events
+
+    # 4. Build full event objects
+    for event in all_raw_events:
+     full_event = build_event(event, current_state)
+     events.append(full_event)
 
     return events

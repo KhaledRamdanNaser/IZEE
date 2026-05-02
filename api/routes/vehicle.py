@@ -29,7 +29,8 @@ def receive_vehicle_location(observation: dict):
         previous_state = {
             "progress": db_state.progress,
             "movement_state": db_state.movement_state,
-            "next_stop_id": db_state.next_stop_id
+            "next_stop_id": db_state.next_stop_id,
+            "stop_sequence": db_state.stop_sequence 
         }
 
     # Process observation using the vehicle state engine
@@ -39,6 +40,8 @@ def receive_vehicle_location(observation: dict):
         route_reference
     )
     events = process_event(current_state=state, previous_state=previous_state)
+    print("PREV STOP_SEQ:", previous_state.get("stop_sequence") if previous_state else None)
+    print("CURR STOP_SEQ:", state.get("stop_sequence"))
     print("EVENTS:", events)
     if db_state:
         # If the vehicle already exists in the database, update the existing record
