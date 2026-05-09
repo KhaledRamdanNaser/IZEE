@@ -1,27 +1,37 @@
-# event_engine/builder.py
-
 import uuid
 
 
-def build_event(event, state):
+def build_event(raw_event, current_state):
     """
-    Build full TransitEvent object
+    Standardize event into TransitEvent contract
     """
 
     return {
         "event_id": str(uuid.uuid4()),
-        "event_type": event["event_type"],
 
-        "vehicle_id": state.get("vehicle_id"),
-        "route_id": state.get("route_id"),
+        "event_type": raw_event.get("event_type"),
 
-        "timestamp": state.get("timestamp"),
+        "vehicle_id": current_state.get("vehicle_id"),
+        "route_id": current_state.get("route_id"),
+        "timestamp": current_state.get("timestamp"),
 
-        "stop_id": event.get("stop_id"),
+        # Optional fields (default None)
+        "stop_id": raw_event.get("stop_id"),
+        "from_stop_id": raw_event.get("from_stop_id"),
+        "to_stop_id": raw_event.get("to_stop_id"),
+        "segment_id": raw_event.get("segment_id"),
+        "stop_sequence": current_state.get("stop_sequence"),
 
-        "metrics": {},
+        # Metrics
+        "metrics": raw_event.get("metrics", {}),
 
-        "confidence": state.get("confidence"),
-        "source": state.get("source"),
-        "simulation_flag": state.get("simulation_flag")
+        # Confidence (allow override)
+        "confidence": raw_event.get(
+            "confidence_override",
+            current_state.get("confidence", "medium")
+        ),
+
+        # Metadata
+        "source": current_state.get("source"),
+        "simulation_flag": current_state.get("simulation_flag")
     }

@@ -34,6 +34,22 @@ def load_route_reference(route_id: str):
         })
 
     db.close()
+    
+
+
+    stops_by_sequence = {}
+
+    for stop in stops:
+        seq = stop["sequence"]
+        stops_by_sequence[seq] = {
+            "stop_id": stop["stop_id"],
+            "lat": stop["lat"],
+            "lon": stop["lon"]
+    }
+
+
+
+
 
     # 4️⃣ Build segments
     segments = []
@@ -47,5 +63,6 @@ def load_route_reference(route_id: str):
     return {
         "route_id": route_id,
         "stops": stops,
-        "segments": segments
+        "segments": segments,
+        "stops_by_sequence": stops_by_sequence   # 🔥 ADD THIS
     }

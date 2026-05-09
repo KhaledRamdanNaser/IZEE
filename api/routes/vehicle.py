@@ -4,47 +4,196 @@ from reference.loader import load_route_reference
 from database.connection import SessionLocal
 from models.vehicle_live_state import VehicleLiveState
 from event_engine.engine import process_event #new
+from event_engine.builder import build_event
+from models.transit_event import TransitEvent
 router = APIRouter()
-
+# 🔥 NEW: short-term memory for transitions
+last_transition_per_vehicle = {}
 # load route once (for now)
 route_reference = load_route_reference("CTA_M_112")
-
+# 🔥 GLOBAL dwell memory
+dwell_tracker = {}
+# 🔥 GLOBAL segment travel timing memory
+segment_timing_tracker = {}
 @router.post("/vehicle/location")
 def receive_vehicle_location(observation: dict):
     vehicle_id = observation["vehicle_id"]
     db = SessionLocal()
 
-    # Query the database to find the previous state of the vehicle
+    # 1️⃣ Load previous state
     db_state = (
         db.query(VehicleLiveState)
         .filter(VehicleLiveState.vehicle_id == vehicle_id)
         .first()
     )
 
-    # Initialize previous state to None
     previous_state = None
 
-    # If a previous state is found, pass it to the observation process
     if db_state:
         previous_state = {
             "progress": db_state.progress,
             "movement_state": db_state.movement_state,
             "next_stop_id": db_state.next_stop_id,
-            "stop_sequence": db_state.stop_sequence 
+            "stop_sequence": db_state.stop_sequence,
+            "current_delay": db_state.current_delay 
         }
 
-    # Process observation using the vehicle state engine
+    # 2️⃣ Process observation
     state = process_observation(
         observation,
         previous_state,
         route_reference
     )
-    events = process_event(current_state=state, previous_state=previous_state)
+
+    events = process_event(
+        current_state=state,
+        previous_state=previous_state,
+        route_reference=route_reference
+    )
+
     print("PREV STOP_SEQ:", previous_state.get("stop_sequence") if previous_state else None)
     print("CURR STOP_SEQ:", state.get("stop_sequence"))
-    print("EVENTS:", events)
+
+    prev_seq = previous_state.get("stop_sequence") if previous_state else None
+    curr_seq = state.get("stop_sequence")
+    current_transition = (prev_seq, curr_seq)
+
+    # 3️⃣ Filter duplicate transitions
+    filtered_events = []
+    last_transition = last_transition_per_vehicle.get(vehicle_id)
+
+    for event in events:
+        # 🔵 Apply duplicate filter ONLY for segment_travel
+        if event["event_type"] == "segment_travel":
+            if last_transition == current_transition:
+                print("IGNORED: duplicate transition", current_transition)
+                continue
+        filtered_events.append(event)
+    # Update only if segment event occurred
+    if any(e["event_type"] == "segment_travel" for e in filtered_events):
+        last_transition_per_vehicle[vehicle_id] = current_transition
+
+    print("EVENTS:", filtered_events)
+
+    # 4️⃣ 🔥 DWELL TIME LOGIC
+    dwell_events = []
+
+
+    for event in filtered_events:
+
+        event_type = event.get("event_type")
+        stop_id = event.get("stop_id")
+        timestamp = event.get("timestamp")
+        from_stop_id = event.get("from_stop_id")
+
+        # 🟢 ARRIVAL
+        if event_type == "stop_arrival":
+            dwell_tracker[vehicle_id] = {
+                "stop_id": stop_id,
+                "arrival_time": timestamp
+            }
+
+        # 🔴 DEPARTURE
+        elif event_type == "stop_departure":
+            segment_timing_tracker[vehicle_id] = {
+                "from_stop_id": stop_id,
+                "departure_time": timestamp,
+                "stop_sequence": previous_state.get("stop_sequence")
+            }
+
+            stored = dwell_tracker.get(vehicle_id)
+            
+
+            if stored and stored.get("stop_id") == stop_id:
+                try:
+                    from datetime import datetime
+
+                    t1 = datetime.fromisoformat(stored["arrival_time"])
+                    t2 = datetime.fromisoformat(timestamp)
+
+                    dwell_time = (t2 - t1).total_seconds()
+
+                    raw_dwell_event = {
+                    "event_type": "dwell_time",
+                    "stop_id": stop_id,
+                    "metrics": {
+                        "dwell_time": dwell_time
+                     }
+                    }
+
+                    full_dwell_event = build_event(raw_dwell_event, state)
+                    dwell_events.append(full_dwell_event)
+                    
+
+                except Exception:
+                    pass
+
+            # cleanup
+            if vehicle_id in dwell_tracker:
+                del dwell_tracker[vehicle_id]
+# 🔵 SEGMENT TRAVEL TIME
+        elif event_type == "segment_travel":
+
+            stored_segment = segment_timing_tracker.get(vehicle_id)
+
+            if stored_segment:
+
+                # ensure correct segment match
+                if stored_segment.get("from_stop_id") == from_stop_id:
+
+                    try:
+                        from datetime import datetime
+
+                        t1 = datetime.fromisoformat(
+                            stored_segment["departure_time"]
+                        )
+
+                        t2 = datetime.fromisoformat(timestamp)
+
+                        travel_time = (t2 - t1).total_seconds()
+
+                        # inject into existing event
+                        event.setdefault("metrics", {})
+                        event["metrics"]["travel_time"] = travel_time
+
+                    except Exception:
+                        pass
+
+                # cleanup
+                del segment_timing_tracker[vehicle_id]       
+                            
+
+    # 5️⃣ Merge events
+    final_events = filtered_events + dwell_events
+
+    print("FINAL EVENTS:", final_events)
+    print("STATE:", state["movement_state"])
+    # 🔥 6️⃣ STORE EVENTS IN DB (ADD HERE)
+    for event in final_events:
+     db_event = TransitEvent(
+        event_id=event["event_id"],
+        event_type=event["event_type"],
+        vehicle_id=event["vehicle_id"],
+        route_id=event["route_id"],
+        timestamp=event["timestamp"],
+
+        stop_id=event.get("stop_id"),
+        from_stop_id=event.get("from_stop_id"),
+        to_stop_id=event.get("to_stop_id"),
+        segment_id=event.get("segment_id"),
+
+        stop_sequence=event.get("stop_sequence"),
+
+        metrics=event.get("metrics", {}),
+
+        confidence=event.get("confidence"),
+        source=event.get("source"),
+        simulation_flag=event.get("simulation_flag")
+    )
+     db.add(db_event)
+
+    # 6️⃣ Update DB
     if db_state:
-        # If the vehicle already exists in the database, update the existing record
         db_state.route_id = state["route_id"]
         db_state.timestamp = state["timestamp"]
         db_state.matched_lat = state["matched_position"]["lat"]
@@ -66,7 +215,6 @@ def receive_vehicle_location(observation: dict):
         db_state.simulation_flag = state["simulation_flag"]
 
     else:
-        # If no previous vehicle state exists, create a new one
         db_state = VehicleLiveState(
             vehicle_id=state["vehicle_id"],
             route_id=state["route_id"],
@@ -89,18 +237,12 @@ def receive_vehicle_location(observation: dict):
             source=state["source"],
             simulation_flag=state["simulation_flag"]
         )
-
-        # Add the new state to the session
         db.add(db_state)
 
-    # Commit changes to the database
     db.commit()
     db.close()
 
-    # Return the current vehicle state as the response
     return state
-
-
 
 
 from fastapi import Query
@@ -162,3 +304,35 @@ def get_live_vehicles(
     db.close()
 
     return result
+
+
+
+
+@router.get("/events")
+def get_events(
+    vehicle_id: str = None,
+    route_id: str = None
+):
+    db = SessionLocal()
+
+    query = db.query(TransitEvent)
+
+    # Optional filtering
+    if vehicle_id:
+        query = query.filter(
+            TransitEvent.vehicle_id == vehicle_id
+        )
+
+    if route_id:
+        query = query.filter(
+            TransitEvent.route_id == route_id
+        )
+
+    # Newest first
+    events = query.order_by(
+        TransitEvent.timestamp.desc()
+    ).all()
+
+    db.close()
+
+    return events

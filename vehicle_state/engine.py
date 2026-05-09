@@ -86,7 +86,7 @@ def process_observation(observation, previous_state, route_reference):
         "movement": "moving" if observation["speed"] > 0 else "stopped",
         "movement_state": movement_state,
 
-        "current_delay": 0,
+        "current_delay": observation.get("current_delay", 0),
         "confidence": confidence,
 
         "source": observation["source"],
