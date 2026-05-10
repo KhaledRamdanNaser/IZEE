@@ -6,6 +6,22 @@ from models.vehicle_live_state import VehicleLiveState
 from event_engine.engine import process_event #new
 from event_engine.builder import build_event
 from models.transit_event import TransitEvent
+
+
+from schemas.transit import VehicleLocationRequest
+from utils.validators import (
+    normalize_timestamp,
+    validate_location,
+    validate_speed,
+    validate_bearing
+)
+
+from enums.transit import SourceEnum, TrustLevelEnum
+
+import uuid
+from datetime import datetime
+
+
 router = APIRouter()
 # 🔥 NEW: short-term memory for transitions
 last_transition_per_vehicle = {}
@@ -15,8 +31,52 @@ route_reference = load_route_reference("CTA_M_112")
 dwell_tracker = {}
 # 🔥 GLOBAL segment travel timing memory
 segment_timing_tracker = {}
+
+
+
 @router.post("/vehicle/location")
-def receive_vehicle_location(observation: dict):
+
+def receive_vehicle_location(raw_payload: dict):
+
+
+    # 🔥 INGESTION NORMALIZATION
+
+    payload = VehicleLocationRequest(**raw_payload)
+
+    # validations
+    normalized_timestamp = normalize_timestamp(payload.timestamp)
+
+    validate_location(payload.lat, payload.lon)
+    validate_speed(payload.speed)
+    validate_bearing(payload.bearing)
+
+    # build standardized TransitObservation
+    observation = {
+        "observation_id": str(uuid.uuid4()),
+
+        "vehicle_id": payload.vehicle_id,
+
+        "timestamp": normalized_timestamp.isoformat(),
+
+        "location": {
+            "lat": payload.lat,
+            "lon": payload.lon
+        },
+
+        "speed": payload.speed,
+        "bearing": payload.bearing,
+
+        # temporary defaults
+        "source": SourceEnum.simulated.value,
+        "simulation_flag": True,
+        "trust_level": TrustLevelEnum.medium.value,
+
+        "raw_payload": raw_payload,
+
+        "ingested_at": datetime.utcnow().isoformat()
+    }
+
+
     vehicle_id = observation["vehicle_id"]
     db = SessionLocal()
 
@@ -106,7 +166,7 @@ def receive_vehicle_location(observation: dict):
 
             if stored and stored.get("stop_id") == stop_id:
                 try:
-                    from datetime import datetime
+                    #from datetime import datetime
 
                     t1 = datetime.fromisoformat(stored["arrival_time"])
                     t2 = datetime.fromisoformat(timestamp)
@@ -142,7 +202,7 @@ def receive_vehicle_location(observation: dict):
                 if stored_segment.get("from_stop_id") == from_stop_id:
 
                     try:
-                        from datetime import datetime
+                       # from datetime import datetime
 
                         t1 = datetime.fromisoformat(
                             stored_segment["departure_time"]
