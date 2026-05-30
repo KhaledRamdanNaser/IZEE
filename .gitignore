@@ -1,4 +1,23 @@
-﻿venv/
+﻿# Python cache
 __pycache__/
-.env
 *.pyc
+*.pyo
+
+# Virtual environment
+venv/
+.env/
+
+# Editor files
+*.swp
+*.DS_Store
+.idea/
+.vscode/
+
+# Ignore simulation folder except observation_generator.py
+simulation/*
+!simulation/observation_generator.py
+
+# Ignore other folders
+data/
+eta_engine/
+scripts/
