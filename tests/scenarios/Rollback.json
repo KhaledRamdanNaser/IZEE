@@ -1,0 +1,83 @@
+{
+"scenario_name": "RollbackOscillationRecovery",
+"vehicle_id": "BusEE_Rollback_Final",
+"expected_behavior": [
+"temporary approach flag safely rolls back upon divergence",
+"no fake stop_arrival or premature completion occurs",
+"final approach and arrival sequence succeeds flawlessly"
+],
+"observations": [
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:20:00",
+"lat": 30.0282248,
+"lon": 31.2374198,
+"speed": 0,
+"bearing": 55
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:20:45",
+"lat": 30.0287981,
+"lon": 31.2382577,
+"speed": 22,
+"bearing": 55
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:21:15",
+"lat": 30.0314731,
+"lon": 31.2421675,
+"speed": 25,
+"bearing": 57
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:21:35",
+"lat": 30.0318115,
+"lon": 31.2426639,
+"speed": 15,
+"bearing": 57
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:21:55",
+"lat": 30.0314731,
+"lon": 31.2421675,
+"speed": 28,
+"bearing": 237
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:22:15",
+"lat": 30.0308000,
+"lon": 31.2411000,
+"speed": 32,
+"bearing": 237
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:22:45",
+"lat": 30.0313000,
+"lon": 31.2418500,
+"speed": 20,
+"bearing": 57
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:23:10",
+"lat": 30.0317500,
+"lon": 31.2425500,
+"speed": 10,
+"bearing": 57
+},
+{
+"vehicle_id": "BusEE_Rollback_Final",
+"timestamp": "2026-05-28T21:23:35",
+"lat": 30.0320463,
+"lon": 31.2430053,
+"speed": 0,
+"bearing": 58
+}
+]
+}

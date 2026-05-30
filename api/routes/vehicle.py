@@ -6,7 +6,7 @@ from models.vehicle_live_state import VehicleLiveState
 from event_engine.engine import process_event #new
 from event_engine.builder import build_event
 from models.transit_event import TransitEvent
-
+from models.transit_observation import TransitObservation
 
 from schemas.transit import VehicleLocationRequest
 from utils.validators import (
@@ -15,7 +15,16 @@ from utils.validators import (
     validate_speed,
     validate_bearing
 )
-
+from event_engine.traversal_tracker import (
+    start_traversal,
+    get_active_traversal,
+    clear_traversal
+)
+from event_engine.dwell_tracker import (
+    start_dwell,
+    get_active_dwell,
+    clear_dwell
+)
 from enums.transit import SourceEnum, TrustLevelEnum
 
 import uuid
@@ -26,13 +35,13 @@ router = APIRouter()
 # 🔥 NEW: short-term memory for transitions
 last_transition_per_vehicle = {}
 # load route once (for now)
-route_reference = load_route_reference("CTA_M_112")
+#route_reference = load_route_reference("CTA_M_112")
 # 🔥 GLOBAL dwell memory
-dwell_tracker = {}
-# 🔥 GLOBAL segment travel timing memory
-segment_timing_tracker = {}
+#dwell_tracker = {}
 
+#segment_completion_tracker = {}
 
+route_cache = {}
 
 @router.post("/vehicle/location")
 
@@ -45,6 +54,7 @@ def receive_vehicle_location(raw_payload: dict):
 
     # validations
     normalized_timestamp = normalize_timestamp(payload.timestamp)
+   # normalized_timestamp =payload.timestamp
 
     validate_location(payload.lat, payload.lon)
     validate_speed(payload.speed)
@@ -55,6 +65,7 @@ def receive_vehicle_location(raw_payload: dict):
         "observation_id": str(uuid.uuid4()),
 
         "vehicle_id": payload.vehicle_id,
+        "route_id": payload.route_id,
 
         "timestamp": normalized_timestamp.isoformat(),
 
@@ -75,10 +86,38 @@ def receive_vehicle_location(raw_payload: dict):
 
         "ingested_at": datetime.utcnow().isoformat()
     }
+    db_observation = TransitObservation(
+    observation_id=observation["observation_id"],
+    vehicle_id=observation["vehicle_id"],
+    route_id=observation["route_id"],
+    timestamp=normalized_timestamp,
+
+    lat=observation["location"]["lat"],
+    lon=observation["location"]["lon"],
+
+    speed=observation["speed"],
+    bearing=observation["bearing"],
+
+    source=observation["source"],
+    simulation_flag=observation["simulation_flag"],
+    trust_level=observation["trust_level"],
+
+    raw_payload=observation["raw_payload"]
+)
 
 
     vehicle_id = observation["vehicle_id"]
     db = SessionLocal()
+
+    route_id = observation["route_id"]
+
+    if route_id not in route_cache:
+        route_cache[route_id] = load_route_reference(route_id)
+
+    route_reference = route_cache[route_id]
+
+    print("ROUTE:", route_reference["route_id"])
+    db.add(db_observation)
 
     # 1️⃣ Load previous state
     db_state = (
@@ -135,96 +174,11 @@ def receive_vehicle_location(raw_payload: dict):
 
     print("EVENTS:", filtered_events)
 
-    # 4️⃣ 🔥 DWELL TIME LOGIC
-    dwell_events = []
-
-
-    for event in filtered_events:
-
-        event_type = event.get("event_type")
-        stop_id = event.get("stop_id")
-        timestamp = event.get("timestamp")
-        from_stop_id = event.get("from_stop_id")
-
-        # 🟢 ARRIVAL
-        if event_type == "stop_arrival":
-            dwell_tracker[vehicle_id] = {
-                "stop_id": stop_id,
-                "arrival_time": timestamp
-            }
-
-        # 🔴 DEPARTURE
-        elif event_type == "stop_departure":
-            segment_timing_tracker[vehicle_id] = {
-                "from_stop_id": stop_id,
-                "departure_time": timestamp,
-                "stop_sequence": previous_state.get("stop_sequence")
-            }
-
-            stored = dwell_tracker.get(vehicle_id)
-            
-
-            if stored and stored.get("stop_id") == stop_id:
-                try:
-                    #from datetime import datetime
-
-                    t1 = datetime.fromisoformat(stored["arrival_time"])
-                    t2 = datetime.fromisoformat(timestamp)
-
-                    dwell_time = (t2 - t1).total_seconds()
-
-                    raw_dwell_event = {
-                    "event_type": "dwell_time",
-                    "stop_id": stop_id,
-                    "metrics": {
-                        "dwell_time": dwell_time
-                     }
-                    }
-
-                    full_dwell_event = build_event(raw_dwell_event, state)
-                    dwell_events.append(full_dwell_event)
-                    
-
-                except Exception:
-                    pass
-
-            # cleanup
-            if vehicle_id in dwell_tracker:
-                del dwell_tracker[vehicle_id]
-# 🔵 SEGMENT TRAVEL TIME
-        elif event_type == "segment_travel":
-
-            stored_segment = segment_timing_tracker.get(vehicle_id)
-
-            if stored_segment:
-
-                # ensure correct segment match
-                if stored_segment.get("from_stop_id") == from_stop_id:
-
-                    try:
-                       # from datetime import datetime
-
-                        t1 = datetime.fromisoformat(
-                            stored_segment["departure_time"]
-                        )
-
-                        t2 = datetime.fromisoformat(timestamp)
-
-                        travel_time = (t2 - t1).total_seconds()
-
-                        # inject into existing event
-                        event.setdefault("metrics", {})
-                        event["metrics"]["travel_time"] = travel_time
-
-                    except Exception:
-                        pass
-
-                # cleanup
-                del segment_timing_tracker[vehicle_id]       
+    
                             
 
     # 5️⃣ Merge events
-    final_events = filtered_events + dwell_events
+    final_events = filtered_events 
 
     print("FINAL EVENTS:", final_events)
     print("STATE:", state["movement_state"])

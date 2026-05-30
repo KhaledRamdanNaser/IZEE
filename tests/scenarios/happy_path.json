@@ -1,0 +1,63 @@
+{
+"scenario_name": "HappyPathFullTraversal",
+"vehicle_id": "BusEE_HappyPath_Final",
+"expected_behavior": [
+"at_stop",
+"stop_departure",
+"between_stops",
+"approaching_stop",
+"at_stop",
+"stop_arrival",
+"segment_completed"
+],
+"observations": [
+{
+"vehicle_id": "BusEE_HappyPath_Final12",
+"timestamp": "2026-05-28T21:00:00",
+"lat": 30.0282248,
+"lon": 31.2374198,
+"speed": 0,
+"bearing": 55
+},
+{
+"vehicle_id": "BusEE_HappyPath_Final12",
+"timestamp": "2026-05-28T21:00:45",
+"lat": 30.0287981,
+"lon": 31.2382577,
+"speed": 15,
+"bearing": 55
+},
+{
+"vehicle_id": "BusEE_HappyPath_Final12",
+"timestamp": "2026-05-28T21:01:30",
+"lat": 30.0301356,
+"lon": 31.2402126,
+"speed": 36,
+"bearing": 56
+},
+{
+"vehicle_id": "BusEE_HappyPath_Final12",
+"timestamp": "2026-05-28T21:02:10",
+"lat": 30.0313000,
+"lon": 31.2418500,
+"speed": 22,
+"bearing": 57
+},
+{
+"vehicle_id": "BusEE_HappyPath_Final12",
+"timestamp": "2026-05-28T21:02:35",
+"lat": 30.0317500,
+"lon": 31.2425500,
+"speed": 10,
+"bearing": 57
+},
+{
+"vehicle_id": "BusEE_HappyPath_Final12",
+"timestamp": "2026-05-28T21:03:00",
+"lat": 30.0320463,
+"lon": 31.2430053,
+"speed": 0,
+"bearing": 58
+}
+]
+}

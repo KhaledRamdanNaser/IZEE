@@ -16,6 +16,7 @@ class TransitObservation(Base):
     observation_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
 
     vehicle_id = Column(String, nullable=True)
+    route_id = Column(String, nullable=False)
 
     timestamp = Column(DateTime, nullable=False)
 

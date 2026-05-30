@@ -5,6 +5,9 @@ from vehicle_state.movement import determine_direction
 from vehicle_state.utils import stabilize_progress
 from vehicle_state.utils import determine_confidence
 from vehicle_state.validation import validate_vehicle_state
+from vehicle_state.transition_tracker import (
+    update_operational_memory
+)
 def process_observation(observation, previous_state, route_reference):
 
     # 1️⃣ Extract GPS
@@ -13,6 +16,7 @@ def process_observation(observation, previous_state, route_reference):
 
     # 2️⃣ Find nearest segment
     segment = find_nearest_segment(lat, lon, route_reference["segments"])
+    print("MATCHED SEGMENT:", segment)
     
     segments = route_reference["segments"]
     segment_index = segments.index(segment)
@@ -42,10 +46,14 @@ def process_observation(observation, previous_state, route_reference):
     proj_lat, proj_lon,
     end["lat"], end["lon"]
 )
+    print("DISTANCE TO NEXT STOP:", distance)
+    print("NEXT STOP:", next_stop_id)
 #Movement State
     movement_state = determine_movement_state(
+    observation["vehicle_id"],
     distance,
     observation["speed"],
+    t,
     previous_state
 )
     direction = determine_direction(
@@ -58,6 +66,12 @@ def process_observation(observation, previous_state, route_reference):
         current_stop_id = next_stop_id
 
     confidence = determine_confidence(observation)
+    # 🔥 continuously update operational continuity memory
+    update_operational_memory(
+        observation["vehicle_id"],
+        distance,
+        t
+    )
 # 4️⃣ Build vehicle state
     vehicle_state = {   
         "vehicle_id": observation["vehicle_id"],

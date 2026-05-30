@@ -14,12 +14,13 @@ def normalize_timestamp(ts: datetime):
 
     # Get time bta3 dlw2ty in UTC
     now = datetime.now(pytz.UTC)
-
+    """
     if ts > now + timedelta(minutes=5):
         raise HTTPException(400, "future timestamp")
 
     if ts < now - timedelta(hours=2):
         raise HTTPException(400, "stale timestamp")
+    """
 
     # 2bl 2lsave fel database convert l naive UTC
     return ts.replace(tzinfo=None)
