@@ -70,7 +70,8 @@ def load_trips():
         for row in reader:
             db.add(Trip(
                 trip_id=row["trip_id"],
-                route_id=row["route_id"]
+                route_id=row["route_id"],
+                direction_id=int(row["direction_id"])
             ))
 
     db.commit()

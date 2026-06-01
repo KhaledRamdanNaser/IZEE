@@ -4,14 +4,24 @@ from models.stop_time import StopTime
 from models.stop import Stop
 
 
-def load_route_reference(route_id: str):
+def load_route_reference(route_id: str,direction_id):
     db = SessionLocal()
 
     # 1️⃣ Get one trip for this route
-    trip = db.query(Trip).filter(Trip.route_id == route_id).first()
+    trip = (
+        db.query(Trip)
+        .filter(
+            Trip.route_id == route_id,
+            Trip.direction_id == direction_id
+        )
+        .first()
+    )
 
     if not trip:
-        raise Exception(f"No trip found for route {route_id}")
+        raise Exception(
+            f"No trip found for route={route_id}, "
+            f"direction={direction_id}"
+        )
 
     # 2️⃣ Get ordered stop_times
     stop_times = (
@@ -62,6 +72,7 @@ def load_route_reference(route_id: str):
 
     return {
         "route_id": route_id,
+        "direction_id": direction_id,
         "stops": stops,
         "segments": segments,
         "stops_by_sequence": stops_by_sequence   # 🔥 ADD THIS

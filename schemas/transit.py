@@ -9,6 +9,7 @@ class Location(BaseModel):
 class VehicleLocationRequest(BaseModel):
     vehicle_id: Optional[str] = None
     route_id: str
+    direction: int
     timestamp: datetime
 
     location: Optional[Location] = None

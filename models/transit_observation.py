@@ -3,6 +3,7 @@ from database.connection import Base
 import datetime
 import uuid
 from enums.transit import SourceEnum, TrustLevelEnum
+from sqlalchemy import Column, Integer, String, ForeignKey
 
 from sqlalchemy import Enum as SQLEnum
 
@@ -33,3 +34,11 @@ class TransitObservation(Base):
     raw_payload = Column(JSON, nullable=True)
 
     ingested_at = Column(DateTime, default=datetime.datetime.utcnow)
+    direction = Column(Integer, nullable=True)
+
+    day_of_week = Column(String, nullable=True)
+    day_number = Column(Integer, nullable=True)
+
+    time_period = Column(String, nullable=True)
+
+    simulation_seed = Column(Integer, nullable=True)

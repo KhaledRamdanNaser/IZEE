@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, ForeignKey
+from sqlalchemy import Column, Integer, String, ForeignKey
 from database.connection import Base
 
 class Trip(Base):
@@ -6,3 +6,4 @@ class Trip(Base):
 
     trip_id = Column(String, primary_key=True)
     route_id = Column(String, ForeignKey("route.route_id"))
+    direction_id = Column(Integer)
