@@ -1,3 +1,4 @@
+from sqlalchemy.exc import IntegrityError
 from database.connection import SessionLocal
 from reference.loader import load_route_reference
 from vehicle_state.engine import process_observation
@@ -192,6 +193,12 @@ def process_observation_pipeline(
     len(db.new)
      )
         db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        print("DUPLICATE OBSERVATION SKIPPED:", e)
+        return None
+
+
     except Exception as e:
         db.rollback()
         print("PIPELINE ERROR:", e)

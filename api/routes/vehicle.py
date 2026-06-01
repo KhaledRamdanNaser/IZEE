@@ -221,14 +221,17 @@ def get_events(
 
 @router.post("/simulation/observation")
 def receive_simulation_observation(raw_payload: dict):
+
     payload = SimulationObservationRequest(**raw_payload)
+
     normalized_timestamp = normalize_timestamp(
-    payload.timestamp
-)
+        payload.timestamp
+    )
+
     validate_location(
-    observation["location"]["lat"],
-    observation["location"]["lon"]
-)
+        payload.location["lat"],
+        payload.location["lon"]
+    )
 
     validate_speed(payload.speed_kmh)
 
