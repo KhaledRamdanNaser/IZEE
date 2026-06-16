@@ -18,6 +18,32 @@ def process_observation_pipeline(
     vehicle_id = observation["vehicle_id"]
     db = SessionLocal()
     try:
+        db_state = (
+            db.query(VehicleLiveState)
+            .filter(
+                VehicleLiveState.vehicle_id == vehicle_id
+            )
+            .first()
+        )
+
+
+        if db_state:
+
+            previous_state = {
+                "progress": db_state.progress,
+                "movement_state": db_state.movement_state,
+                "next_stop_id": db_state.next_stop_id,
+                "stop_sequence": db_state.stop_sequence,
+                "current_delay": db_state.current_delay,
+
+                "segment_id": db_state.segment_id,
+                "segment_progress": db_state.segment_progress,
+                "distance_to_next_stop": db_state.distance_to_next_stop,
+                "speed": db_state.speed
+            }
+
+        else:
+            previous_state = None
 
         route_id = observation["route_id"]
         direction_id=observation["direction"]

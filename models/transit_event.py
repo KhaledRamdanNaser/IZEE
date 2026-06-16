@@ -28,3 +28,9 @@ class TransitEvent(Base):
     confidence = Column(String)
     source = Column(String)
     simulation_flag = Column(Boolean)
+
+    # --- KHALED EDIT START ---
+    day_of_week = Column(String, nullable=True)
+    time_period  = Column(String, nullable=True)
+    direction    = Column(Integer, nullable=True)
+    # --- KHALED EDIT END ---
