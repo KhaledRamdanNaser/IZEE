@@ -11,12 +11,39 @@ route_cache = {}
 
 last_transition_per_vehicle = {}
 
+# --- KHALED EDIT START ---
 def process_observation_pipeline(
     observation,
-    db_observation
+    db_observation,
+    db=None,
+    vehicle_state_cache=None,
+    persist_observation=True
 ):
+    # vehicle_state_cache is an optional in-memory dict
+    # (vehicle_id -> VehicleLiveState instance) supplied by callers
+    # like scripts/bulk_replay.py to avoid a DB round trip per
+    # observation. The default stays None so the normal API path
+    # (which never passes this parameter) keeps querying the DB
+    # exactly as before — fully backward compatible.
+    #
+    # persist_observation controls whether this function ORM-adds
+    # db_observation itself. Default True preserves the normal API
+    # path exactly as before. bulk_replay.py passes False and instead
+    # bulk-inserts TransitObservation rows itself via
+    # db.bulk_insert_mappings() at the end of each batch, which is
+    # far faster than one db.add() per row. When False, db_observation
+    # is unused by this function (the caller is responsible for it).
+    # --- KHALED EDIT END ---
     vehicle_id = observation["vehicle_id"]
-    db = SessionLocal()
+    # --- KHALED EDIT START ---
+    # If no session was passed in, open one and own its lifecycle
+    # (commit/close) ourselves — preserves the original behavior.
+    # If a session WAS passed in, the caller owns commit/close
+    # (used by bulk_replay.py for batched commits across many calls).
+    owns_session = db is None
+    if owns_session:
+        db = SessionLocal()
+    # --- KHALED EDIT END ---
     try:
 
         route_id = observation["route_id"]
@@ -42,14 +69,22 @@ def process_observation_pipeline(
         """
 
         print("ROUTE:", route_reference["route_id"])
-        db.add(db_observation)
+        # --- KHALED EDIT START ---
+        if persist_observation:
+            db.add(db_observation)
+        # --- KHALED EDIT END ---
 
         # 1️⃣ Load previous state
-        db_state = (
-            db.query(VehicleLiveState)
-            .filter(VehicleLiveState.vehicle_id == vehicle_id)
-            .first()
-        )
+        # --- KHALED EDIT START ---
+        if vehicle_state_cache is not None:
+            db_state = vehicle_state_cache.get(vehicle_id)
+        else:
+            db_state = (
+                db.query(VehicleLiveState)
+                .filter(VehicleLiveState.vehicle_id == vehicle_id)
+                .first()
+            )
+        # --- KHALED EDIT END ---
 
         previous_state = None
 
@@ -129,16 +164,21 @@ def process_observation_pipeline(
 
                 confidence=event.get("confidence"),
                 source=event.get("source"),
-                simulation_flag=event.get("simulation_flag")
+                simulation_flag=event.get("simulation_flag"),
+
+                # --- KHALED EDIT START ---
+                day_of_week=observation.get("day_of_week"),
+                time_period=observation.get("time_period"),
+                direction=observation.get("direction"),
+                # --- KHALED EDIT END ---
             )
             db.add(db_event)
-        event_count = sum(
-            1
-            for obj in db.new
-            if isinstance(obj, TransitEvent)
-        )
-
-        print("EVENTS STAGED:", event_count)
+        # --- KHALED EDIT START ---
+        # Removed: quadratic event_count computation
+        # that scanned db.new on every observation
+        # only to feed a silenced print. O(batch^2)
+        # with no functional purpose.
+        # --- KHALED EDIT END ---
 
         # 6️⃣ Update DB
         if db_state:
@@ -187,12 +227,21 @@ def process_observation_pipeline(
             )
             db.add(db_state)
 
+        # --- KHALED EDIT START ---
+        # Keep the in-memory cache in sync so the NEXT observation
+        # for this vehicle hits the cache instead of the DB.
+        if vehicle_state_cache is not None:
+            vehicle_state_cache[vehicle_id] = db_state
+        # --- KHALED EDIT END ---
 
         print(
     "DB NEW OBJECTS:",
     len(db.new)
      )
-        db.commit()
+        # --- KHALED EDIT START ---
+        if owns_session:
+            db.commit()
+        # --- KHALED EDIT END ---
     except IntegrityError as e:
         db.rollback()
         print("DUPLICATE OBSERVATION SKIPPED:", e)
@@ -203,8 +252,11 @@ def process_observation_pipeline(
         db.rollback()
         print("PIPELINE ERROR:", e)
         raise
-    finally:    
-        db.close()
+    finally:
+        # --- KHALED EDIT START ---
+        if owns_session:
+            db.close()
+        # --- KHALED EDIT END ---
 
     return state
 

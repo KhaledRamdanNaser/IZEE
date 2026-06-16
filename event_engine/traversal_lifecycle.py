@@ -29,6 +29,102 @@ def process_traversal_lifecycle(
     generated_events = []
 
     vehicle_id = current_state.get("vehicle_id")
+        # -----------------------------------
+    # SEGMENT TRANSITION COMPLETION
+    # -----------------------------------
+
+    active_traversal = get_active_traversal(
+        vehicle_id
+    )
+
+    if (
+        active_traversal
+        and previous_state
+    ):
+
+        stored_segment = active_traversal.get(
+            "segment_id"
+        )
+
+        current_segment = current_state.get(
+            "segment_id"
+        )
+
+        if (
+            stored_segment
+            and current_segment
+            and stored_segment != current_segment
+        ):
+
+            try:
+
+                t1 = datetime.fromisoformat(
+                    active_traversal["departure_time"]
+                )
+
+                t2 = datetime.fromisoformat(
+                    current_state["timestamp"]
+                )
+
+                travel_time = (
+                    t2 - t1
+                ).total_seconds()
+                if travel_time <= 0:
+
+                    clear_traversal(
+                        vehicle_id
+                    )
+
+                    return generated_events
+
+
+
+                raw_segment_completed = {
+                    "event_type": "segment_completed",
+
+                    "from_stop_id":
+                        active_traversal["from_stop_id"],
+
+                    "to_stop_id":
+                        stored_segment.split("_")[1],
+
+                    "segment_id":
+                        stored_segment,
+
+                    "metrics": {
+                        "travel_time": travel_time,
+                        "completion_method":
+                            "segment_transition"
+                    }
+                }
+
+
+                generated_events.append(
+                    build_event(
+                        raw_segment_completed,
+                        current_state
+                    )
+                )
+
+            except Exception as e:
+
+                print(
+                    "Segment transition completion failed:",
+                    e
+                )
+
+
+            clear_traversal(
+                vehicle_id
+            )
+
+
+            start_traversal(
+                vehicle_id,
+                current_segment.split("_")[0],
+                current_state.get("timestamp"),
+                current_segment
+            )
     # -----------------------------------
     # OPERATIONAL TRAVERSAL BOOTSTRAP
     # -----------------------------------
@@ -115,16 +211,21 @@ def process_traversal_lifecycle(
         # fallback protection
         if not origin_stop_id:
 
-            origin_stop_id = current_state.get(
-                "next_stop_id"
+            segment_id = current_state.get(
+                "segment_id"
             )
 
-        start_traversal(
-            vehicle_id,
-            origin_stop_id,
-            current_state.get("timestamp"),
-            current_state.get("segment_id")
-        )
+            if segment_id:
+                origin_stop_id = segment_id.split("_")[0]
+
+        if origin_stop_id and current_state.get("segment_id"):
+
+            start_traversal(
+                vehicle_id,
+                origin_stop_id,
+                current_state.get("timestamp"),
+                current_state.get("segment_id")
+            )
 
     for event in events:
 
@@ -140,13 +241,49 @@ def process_traversal_lifecycle(
 
         if event_type == "stop_departure":
 
-            start_traversal(
-                vehicle_id,
-                stop_id,
-                timestamp,
-                current_state.get("segment_id")
+            departure_segment = current_state.get(
+                "segment_id"
             )
 
+            if (
+                departure_segment
+                and not departure_segment.startswith(
+                    f"{stop_id}_"
+                )
+            ):
+
+                departure_segment = None
+
+
+            if not departure_segment:
+
+                current_sequence = current_state.get(
+                    "stop_sequence"
+                )
+
+                segments = route_reference.get(
+                    "segments",
+                    []
+                )
+
+                # --- KHALED EDIT START ---
+                for segment in segments:
+
+                    if segment["start"]["stop_id"] == stop_id:
+
+                        departure_segment = segment["segment_id"]
+                        break
+                # --- KHALED EDIT END ---
+
+
+            if departure_segment:
+
+                start_traversal(
+                    vehicle_id,
+                    stop_id,
+                    timestamp,
+                    departure_segment
+                )
         # -----------------------------------
         # STOP ARRIVAL
         # -----------------------------------
@@ -158,6 +295,13 @@ def process_traversal_lifecycle(
             )
 
             if not stored:
+                continue
+
+
+            if stored["segment_id"] != current_state["segment_id"]:
+                clear_traversal(
+                    vehicle_id
+                )
                 continue
 
             try:
@@ -173,6 +317,9 @@ def process_traversal_lifecycle(
                 travel_time = (
                     t2 - t1
                 ).total_seconds()
+                if travel_time <= 0:
+                    clear_traversal(vehicle_id)
+                    continue
 
                 raw_segment_completed = {
                     "event_type": "segment_completed",
@@ -183,7 +330,8 @@ def process_traversal_lifecycle(
                     "segment_id": stored["segment_id"],
 
                     "metrics": {
-                        "travel_time": travel_time
+                        "travel_time": travel_time,
+                        "completion_method": "stop_arrival"
                     }
                 }
 
@@ -196,9 +344,13 @@ def process_traversal_lifecycle(
                     full_segment_completed
                 )
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(
+                    "Stop arrival completion failed:",
+                    e
+                )
 
             clear_traversal(vehicle_id)
+
 
     return generated_events
