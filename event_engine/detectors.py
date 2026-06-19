@@ -30,7 +30,10 @@ def detect_stop_events(current_state, previous_state):
         print("🚪 DEPARTURE CONDITION TRIGGERED")
         events.append({
             "event_type": "stop_departure",
-            "stop_id": previous_state.get("next_stop_id")
+            "stop_id": (
+                previous_state.get("current_stop_id")
+                or previous_state.get("next_stop_id")
+            )
         })
 
     return events

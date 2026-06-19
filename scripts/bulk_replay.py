@@ -27,6 +27,7 @@ import argparse
 import json
 import time
 import builtins
+import os
 from datetime import datetime
 
 from sqlalchemy import text
@@ -52,7 +53,7 @@ from vehicle_state.transition_tracker import (
     vehicle_operational_memory
 )
 
-CONVERTED_DIR = r"E:\Last Semster\IZEE_SUMO\converted"
+CONVERTED_DIR = os.getenv("IZEE_CONVERTED_DIR", r"E:\Last Semster\IZEE_SUMO\converted")
 
 # All 21 days, in calendar order — used by FULL mode (one-time
 # overnight production run).
@@ -88,6 +89,14 @@ TEST_FILES = [
     "day_5_friday_observations.jsonl",
     "day_6_saturday_observations.jsonl",
 ]
+
+CUSTOM_REPLAY_FILES = os.getenv("IZEE_REPLAY_FILES")
+if CUSTOM_REPLAY_FILES:
+    TEST_FILES = [
+        file_name.strip()
+        for file_name in CUSTOM_REPLAY_FILES.split(",")
+        if file_name.strip()
+    ]
 # --- KHALED EDIT END ---
 
 # --- KHALED EDIT START ---
@@ -129,12 +138,23 @@ def build_observation_and_db_row(raw_obs, persist_observation=True):
     are set explicitly here.
     # --- KHALED EDIT END ---
     """
+    if "location" not in raw_obs:
+        raw_obs["location"] = {
+            "lat": raw_obs["lat"],
+            "lon": raw_obs["lon"]
+        }
+
+    raw_obs.setdefault("day_of_week", "Monday")
+    raw_obs.setdefault("day_number", 1)
+    raw_obs.setdefault("time_period", "peak")
+    raw_obs.setdefault("simulation_seed", 1)
+
     raw_timestamp = datetime.fromisoformat(raw_obs["timestamp"])
     normalized_timestamp = normalize_timestamp(raw_timestamp)
 
     lat = raw_obs["location"]["lat"]
     lon = raw_obs["location"]["lon"]
-    speed = raw_obs["speed"]  # already remapped from speed_kmh
+    speed = raw_obs["speed"]  # already normalized from speed/speed_kmh
     bearing = raw_obs["bearing"]
 
     validate_location(lat, lon)
@@ -348,7 +368,10 @@ def replay_day_file(db, vehicle_state_cache, file_path, day_label):
                 # actually see (malformed lines), with NO DB work.
                 try:
                     raw_obs = json.loads(line)
-                    raw_obs["speed"] = raw_obs.pop("speed_kmh")
+                    if "speed_kmh" in raw_obs:
+                        raw_obs["speed"] = raw_obs.pop("speed_kmh")
+                    elif "speed" not in raw_obs:
+                        raise ValueError("Observation must include speed or speed_kmh")
                 except Exception as e:
                     errors += 1
                     _restore_prints()

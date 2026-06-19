@@ -13,6 +13,7 @@ import models.transit_observation
 # --- KHALED EDIT START ---
 import models.segment_statistics
 # --- KHALED EDIT END ---
+import alert_engine.models
 print(Base.metadata.tables)
 print("Registered tables:", Base.metadata.tables.keys())
 Base.metadata.create_all(bind=engine)

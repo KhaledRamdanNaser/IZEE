@@ -92,7 +92,9 @@ def process_observation_pipeline(
             previous_state = {
                 "progress": db_state.progress,
                 "movement_state": db_state.movement_state,
+                "current_stop_id": db_state.current_stop_id,
                 "next_stop_id": db_state.next_stop_id,
+                "segment_id": db_state.segment_id,
                 "stop_sequence": db_state.stop_sequence,
                 "current_delay": db_state.current_delay 
             }
