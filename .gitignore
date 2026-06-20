@@ -1,0 +1,8 @@
+*
+!izee_backend/
+!passenger_app/
+!driver_app/
+!supervisor_app/
+!control_center_dashboard/
+!/.gitignore
+**/.git.bak/
