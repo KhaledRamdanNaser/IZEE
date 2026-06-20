@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>IZEE Control</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">IZ</div>
+          <div>
+            <h1>IZEE Control</h1>
+            <p>Smart Transit System</p>
+          </div>
+        </div>
+
+        <nav class="nav-list" aria-label="Main navigation">
+          <button class="nav-item is-active" data-view="dashboard"><span class="icon icon-grid"></span>Dashboard</button>
+          <button class="nav-item" data-view="map"><span class="icon icon-map"></span>Live Map</button>
+          <button class="nav-item" data-view="analytics"><span class="icon icon-trend"></span>Analytics</button>
+          <button class="nav-item" data-view="incidents"><span class="icon icon-alert"></span>Incidents</button>
+          <button class="nav-item" data-view="communications"><span class="icon icon-message"></span>Communications</button>
+          <button class="nav-item" data-view="users"><span class="icon icon-users"></span>Users</button>
+          <button class="nav-item" data-view="regions"><span class="icon icon-map"></span>Regions</button>
+          <button class="nav-item" data-view="configuration"><span class="icon icon-settings"></span>Configuration</button>
+          <button class="nav-item" data-view="logs"><span class="icon icon-file"></span>Logs & Reports</button>
+        </nav>
+
+        <div class="operator">
+          <div class="avatar">AH</div>
+          <div>
+            <strong>Ahmed Hassan</strong>
+            <span>Control Center Operator</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2 id="page-title">Dashboard</h2>
+            <p>Friday, June 12, 2026</p>
+          </div>
+          <div class="top-actions">
+            <button class="bell" aria-label="Notifications"><span></span></button>
+            <time id="clock">12:22 AM</time>
+          </div>
+        </header>
+        <section id="content" class="content" aria-live="polite"></section>
+      </main>
+    </div>
+
+    <script src="app.js?v=2"></script>
+  </body>
+</html>

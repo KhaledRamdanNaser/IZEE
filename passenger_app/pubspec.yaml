@@ -1,0 +1,23 @@
+name: izee_ui
+description: A connected Flutter prototype for the IZEE public transport app.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.3.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_map: ^6.1.0
+  geolocator: ^12.0.0
+  http: ^1.2.2
+  latlong2: ^0.9.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true

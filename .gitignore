@@ -1,8 +1,37 @@
-*
-!izee_backend/
-!passenger_app/
-!driver_app/
-!supervisor_app/
-!control_center_dashboard/
+# Ignore everything at the root by default
+/*
+
+# Do not ignore these specific projects
+!/control_center_dashboard/
+!/driver_app/
+!/izee_backend/
+!/passenger_app/
+!/supervisor_app/
 !/.gitignore
+
+# Python / FastAPI (izee_backend) ignores
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/venv/
+**/.venv/
+**/izee.db
+**/.pytest_cache/
+**/.cache/
+**/.vscode/
+**/temp_trip_plan.py
+
+# Flutter / Dart ignores
+**/.dart_tool/
+**/build/
+**/.idea/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/.metadata
+**/*.iml
+**/flutter_server.err
+**/flutter_server.log
+
+# General ignores
 **/.git.bak/
+**/.DS_Store
