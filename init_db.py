@@ -10,6 +10,7 @@ import models.shape
 import models.vehicle_live_state
 import models.transit_event
 import models.transit_observation
+from models.vehicle_state_history import VehicleStateHistory
 print(Base.metadata.tables)
 print("Registered tables:", Base.metadata.tables.keys())
 Base.metadata.create_all(bind=engine)

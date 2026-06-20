@@ -69,6 +69,14 @@ def process_traversal_lifecycle(
                 travel_time = (
                     t2 - t1
                 ).total_seconds()
+                if travel_time <= 0:
+
+                    clear_traversal(
+                        vehicle_id
+                    )
+
+                    return generated_events
+                                
 
 
                 raw_segment_completed = {
@@ -108,6 +116,14 @@ def process_traversal_lifecycle(
 
             clear_traversal(
                 vehicle_id
+            )
+
+
+            start_traversal(
+                vehicle_id,
+                current_segment.split("_")[0],
+                current_state.get("timestamp"),
+                current_segment
             )
     # -----------------------------------
     # OPERATIONAL TRAVERSAL BOOTSTRAP
@@ -225,13 +241,54 @@ def process_traversal_lifecycle(
 
         if event_type == "stop_departure":
 
-            start_traversal(
-                vehicle_id,
-                stop_id,
-                timestamp,
-                current_state.get("segment_id")
+            departure_segment = current_state.get(
+                "segment_id"
             )
 
+            if (
+                departure_segment
+                and not departure_segment.startswith(
+                    f"{stop_id}_"
+                )
+            ):
+
+                departure_segment = None
+
+
+            if not departure_segment:
+
+                current_sequence = current_state.get(
+                    "stop_sequence"
+                )
+
+                segments = route_reference.get(
+                    "segments",
+                    []
+                )
+
+                for segment in segments:
+
+                    from_stop_id = (
+                        segment.get("from_stop_id")
+                        or segment.get("start", {}).get("stop_id")
+                    )
+
+                    if from_stop_id == stop_id:
+
+                        departure_segment = segment.get(
+                            "segment_id"
+                        )
+
+                        break
+
+            if departure_segment:
+
+                start_traversal(
+                    vehicle_id,
+                    stop_id,
+                    timestamp,
+                    departure_segment
+                )
         # -----------------------------------
         # STOP ARRIVAL
         # -----------------------------------
@@ -265,6 +322,9 @@ def process_traversal_lifecycle(
                 travel_time = (
                     t2 - t1
                 ).total_seconds()
+                if travel_time <= 0:
+                    clear_traversal(vehicle_id)
+                    continue
 
                 raw_segment_completed = {
                     "event_type": "segment_completed",
@@ -275,7 +335,8 @@ def process_traversal_lifecycle(
                     "segment_id": stored["segment_id"],
 
                     "metrics": {
-                        "travel_time": travel_time
+                        "travel_time": travel_time,
+                        "completion_method": "stop_arrival"
                     }
                 }
 
@@ -288,15 +349,13 @@ def process_traversal_lifecycle(
                     full_segment_completed
                 )
 
-            except Exception:
-                pass
+            except Exception as e:
+                print(
+                    "Stop arrival completion failed:",
+                    e
+                )
 
             clear_traversal(vehicle_id)
-            start_traversal(
-            vehicle_id,
-            current_segment.split("_")[0],
-            current_state.get("timestamp"),
-            current_segment
-        )
+
 
     return generated_events

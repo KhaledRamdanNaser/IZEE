@@ -52,8 +52,9 @@ def process_dwell_lifecycle(
             )
 
             # check traversal completion
-            stored = get_active_traversal(vehicle_id)
+           # stored = get_active_traversal(vehicle_id)
 
+            """"
             if stored:
 
                 try:
@@ -97,19 +98,21 @@ def process_dwell_lifecycle(
 
                 # cleanup traversal lifecycle
                 clear_traversal(vehicle_id)
-
+            """  
         # -----------------------------------
         # DEPARTURE
         # -----------------------------------
 
         elif event_type == "stop_departure":
 
+            """
             start_traversal(
                 vehicle_id,
                 stop_id,
                 timestamp,
                 current_state.get("segment_id")
             )
+            """
 
             stored_dwell = get_active_dwell(
                 vehicle_id
