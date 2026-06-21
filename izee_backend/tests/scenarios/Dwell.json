@@ -1,0 +1,64 @@
+
+{
+  "scenario_name": "DwellLifecycleValidation",
+  "vehicle_id": "BusEE_Dwell_Final",
+  "expected_behavior": [
+    "vehicle begins already servicing operational stop",
+    "stop_arrival emitted exactly once upon stop acquisition",
+    "multiple stationary observations preserve stable at_stop ownership",
+    "leaving_stop transition triggers clean stop_departure event",
+    "dwell_time emitted exactly once during departure finalization",
+    "post-departure traversal bootstrap initializes correctly"
+  ],
+  "observations": [
+    {
+      "vehicle_id": "BusEE_Dwell_Final2",
+      "timestamp": "2026-05-28T21:30:00",
+      "lat": 30.0319500,
+      "lon": 31.2429000,
+      "speed": 2,
+      "bearing": 58
+    },
+    {
+      "vehicle_id": "BusEE_Dwell_Final2",
+      "timestamp": "2026-05-28T21:30:20",
+      "lat": 30.0320463,
+      "lon": 31.2430053,
+      "speed": 0,
+      "bearing": 58
+    },
+    {
+      "vehicle_id": "BusEE_Dwell_Final2",
+      "timestamp": "2026-05-28T21:31:20",
+      "lat": 30.0320463,
+      "lon": 31.2430053,
+      "speed": 0,
+      "bearing": 58
+    },
+    {
+      "vehicle_id": "BusEE_Dwell_Final2",
+      "timestamp": "2026-05-28T21:32:20",
+      "lat": 30.0320463,
+      "lon": 31.2430053,
+      "speed": 0,
+      "bearing": 58
+    },
+    {
+      "vehicle_id": "BusEE_Dwell_Final2",
+      "timestamp": "2026-05-28T21:33:00",
+      "lat": 30.0317000,
+      "lon": 31.2425000,
+      "speed": 10,
+      "bearing": 238
+    },
+    {
+      "vehicle_id": "BusEE_Dwell_Final2",
+      "timestamp": "2026-05-28T21:33:30",
+      "lat": 30.0310000,
+      "lon": 31.2414000,
+      "speed": 22,
+      "bearing": 238
+    }
+  ]
+}
+
