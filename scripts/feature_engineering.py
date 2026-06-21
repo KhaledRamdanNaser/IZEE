@@ -207,6 +207,93 @@ def load_vehicle_state_history(db) -> list[dict]:
     return rows
 # --- SALAH EDIT START ---
 
+def build_segment_start_lookup(states):
+
+    """
+    Derive segment entry time from VehicleStateHistory.
+
+    Key:
+    (vehicle_id, merged_segment_id)
+
+    Value:
+    earliest timestamp seen in that segment
+    """
+
+    lookup = {}
+
+    for state in states:
+
+        merged_segment_id = apply_merge_map(
+            state["segment_id"],
+            state["route_id"],
+            state["direction"]
+        )
+
+        key = (
+            state["vehicle_id"],
+            merged_segment_id
+        )
+
+        ts = parse_timestamp(
+            state["timestamp"]
+        )
+
+        if ts is None:
+            continue
+
+        if (
+            key not in lookup
+            or ts < lookup[key]
+        ):
+            lookup[key] = ts
+
+    return lookup
+
+# --- SALAH EDIT END ---
+# --- SALAH EDIT START ---
+
+def calculate_current_delay(
+    state,
+    segment_start_lookup,
+    avg_segment_time
+):
+
+    if avg_segment_time is None:
+        return 0.0
+
+
+    key = (
+        state["vehicle_id"],
+        state["segment_id"]
+    )
+
+    start_time = segment_start_lookup.get(key)
+
+    if start_time is None:
+        return 0.0
+
+
+    snapshot_time = parse_timestamp(
+        state["timestamp"]
+    )
+
+    elapsed = (
+        snapshot_time - start_time
+    ).total_seconds()
+
+
+    expected = (
+        avg_segment_time
+        *
+        state["segment_progress"]
+    )
+
+
+    return elapsed - expected
+
+# --- SALAH EDIT END ---
+# --- SALAH EDIT START ---
+
 def load_segment_completions(db):
 
     """
@@ -436,6 +523,7 @@ def build_feature_rows(
     stop_coords: dict,
     seg_stats: dict,
     completion_lookup: dict,
+    segment_start_lookup: dict,
     split: str,                # "train" or "test"
 ) -> list[dict]:
     """
@@ -507,7 +595,12 @@ def build_feature_rows(
         segment_length_m = compute_segment_length(merged_segment_id, stop_coords)
 
         # --- CURRENT DELAY ---
-        current_delay = 0.0  # TODO: Replace with live delay calculation using segment_start_time, segment_progress, and avg_segment_time
+        #current_delay = 0.0  # TODO: Replace with live delay calculation using segment_start_time, segment_progress, and avg_segment_time
+        current_delay = calculate_current_delay(
+            state_for_label,
+            segment_start_lookup,
+            avg_segment_time
+        )        
 
         rows.append({
             "state_id":           state["state_id"],
@@ -859,8 +952,11 @@ def main():
     # Build feature rows
     # ------------------------------------------------------------------
     print("\n[4/5] Building feature rows...")
-    train_rows = build_feature_rows(raw_train, stop_coords, seg_stats, completion_lookup,split="train")
-    test_rows  = build_feature_rows(raw_test,  stop_coords, seg_stats,completion_lookup, split="test")
+    segment_start_lookup = build_segment_start_lookup(
+    all_states
+    )
+    train_rows = build_feature_rows(raw_train, stop_coords, seg_stats, completion_lookup, segment_start_lookup, split="train")
+    test_rows  = build_feature_rows(raw_test,  stop_coords, seg_stats,completion_lookup, segment_start_lookup, split="test")
     print(f"  Feature rows built -> TRAIN: {len(train_rows):,}  TEST: {len(test_rows):,}")
 
     # ------------------------------------------------------------------

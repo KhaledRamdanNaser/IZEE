@@ -78,7 +78,6 @@ def process_traversal_lifecycle(
                     return generated_events
 
 
-
                 raw_segment_completed = {
                     "event_type": "segment_completed",
 
@@ -266,15 +265,20 @@ def process_traversal_lifecycle(
                     []
                 )
 
-                # --- KHALED EDIT START ---
                 for segment in segments:
 
-                    if segment["start"]["stop_id"] == stop_id:
+                    from_stop_id = (
+                        segment.get("from_stop_id")
+                        or segment.get("start", {}).get("stop_id")
+                    )
 
-                        departure_segment = segment["segment_id"]
+                    if from_stop_id == stop_id:
+
+                        departure_segment = segment.get(
+                            "segment_id"
+                        )
+
                         break
-                # --- KHALED EDIT END ---
-
 
             if departure_segment:
 

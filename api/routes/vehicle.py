@@ -7,6 +7,9 @@ from event_engine.engine import process_event #new
 from event_engine.builder import build_event
 from models.transit_event import TransitEvent
 from models.transit_observation import TransitObservation
+from fastapi import HTTPException
+from pydantic import ValidationError
+from models.vehicle_state_history import VehicleStateHistory
 
 from schemas.transit import VehicleLocationRequest
 from utils.validators import (
@@ -52,6 +55,7 @@ route_cache = {}
 # source = driver_app
 # simulation_flag = False
 # trust_level = high
+
 @router.post("/vehicle/location")
 
 def receive_vehicle_location(raw_payload: dict):
@@ -59,15 +63,33 @@ def receive_vehicle_location(raw_payload: dict):
 
     # 🔥 INGESTION NORMALIZATION
 
-    payload = VehicleLocationRequest(**raw_payload)
+    try:
+        payload = VehicleLocationRequest(**raw_payload)
 
+    except ValidationError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=e.errors()[0]["msg"]
+        )
     # validations
     normalized_timestamp = normalize_timestamp(payload.timestamp)
    # normalized_timestamp =payload.timestamp
+    print("[TIMESTAMP NORMALIZED]")
+    print("original:", payload.timestamp)
+    print("normalized:", normalized_timestamp)
 
     validate_location(payload.lat, payload.lon)
     validate_speed(payload.speed)
     validate_bearing(payload.bearing)
+    print("========== INGESTION TEST ==========")
+
+    print("[VALIDATION PASSED]")
+    print("vehicle_id:", payload.vehicle_id)
+    print("route_id:", payload.route_id)
+    print("lat:", payload.lat)
+    print("lon:", payload.lon)
+    print("speed:", payload.speed)
+    print("bearing:", payload.bearing)
 
     # build standardized TransitObservation
     observation = {
@@ -96,6 +118,8 @@ def receive_vehicle_location(raw_payload: dict):
 
         "ingested_at": datetime.utcnow().isoformat()
     }
+    print("[TRANSIT OBSERVATION CREATED]")
+    print(observation)
     db_observation = TransitObservation(
     observation_id=observation["observation_id"],
     vehicle_id=observation["vehicle_id"],
@@ -114,13 +138,11 @@ def receive_vehicle_location(raw_payload: dict):
 
     raw_payload=observation["raw_payload"]
 )
+    print("[FORWARDING TO PROCESSING PIPELINE]")
     return process_observation_pipeline(
     observation,
     db_observation 
 )
-
-
-
 
 
 
@@ -236,6 +258,10 @@ def receive_simulation_observation(raw_payload: dict):
     validate_speed(payload.speed_kmh)
 
     validate_bearing(payload.bearing)
+    print("[SIMULATION OBSERVATION RECEIVED]")
+    print("[NORMALIZING TO TRANSIT OBSERVATION]")
+    print("source = simulated")
+    print("simulation_flag = true")
 
     observation = {
     "observation_id": str(uuid.uuid4()),
@@ -295,6 +321,7 @@ def receive_simulation_observation(raw_payload: dict):
 
     raw_payload=observation["raw_payload"]
 )
+    print("[FORWARDING TO PROCESSING PIPELINE](Simulation Version)")
     return process_observation_pipeline(
     observation,
     db_observation

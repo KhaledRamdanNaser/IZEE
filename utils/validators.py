@@ -28,23 +28,34 @@ def normalize_timestamp(ts: datetime):
 # Validate Location
 def validate_location(lat: float, lon: float):
     if not (-90 <= lat <= 90):
+        print("[VALIDATION FAILED]")
+        print("Reason: Invalid coordinates")
         raise HTTPException(400, "invalid latitude")
 
     if not (-180 <= lon <= 180):
+        print("[VALIDATION FAILED]")
+        print("Reason: Invalid coordinates")
         raise HTTPException(400, "invalid longitude")
 
 # Validate speed lw feh
 def validate_speed(speed: float | None):
     if speed is not None:
         if speed < 0:
+            print("[VALIDATION FAILED]")
+            print("Reason: Invalid movement attribute")
             raise HTTPException(400, "negative speed")
+            
         if speed >= 130:
+            print("[VALIDATION FAILED]")
+            print("Reason: Invalid movement attribute")
             raise HTTPException(400, "unrealistic speed")
 
 # Validate bearing lw feh
 def validate_bearing(bearing: float | None):
     if bearing is not None:
         if not (0 <= bearing <= 360):
+            print("[VALIDATION FAILED]")
+            print("Reason: Invalid movement attribute")
             raise HTTPException(400, "invalid bearing")
         
 

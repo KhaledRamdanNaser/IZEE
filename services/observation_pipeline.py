@@ -5,7 +5,7 @@ from vehicle_state.engine import process_observation
 from event_engine.engine import process_event
 from models.transit_event import TransitEvent
 from models.vehicle_live_state import VehicleLiveState
-
+from models.vehicle_state_history import VehicleStateHistory
 
 route_cache = {}
 
@@ -35,7 +35,6 @@ def process_observation_pipeline(
     # is unused by this function (the caller is responsible for it).
     # --- KHALED EDIT END ---
     vehicle_id = observation["vehicle_id"]
-    # --- KHALED EDIT START ---
     # If no session was passed in, open one and own its lifecycle
     # (commit/close) ourselves — preserves the original behavior.
     # If a session WAS passed in, the caller owns commit/close
@@ -43,8 +42,35 @@ def process_observation_pipeline(
     owns_session = db is None
     if owns_session:
         db = SessionLocal()
-    # --- KHALED EDIT END ---
+    
+    final_events = []
     try:
+        db_state = (
+            db.query(VehicleLiveState)
+            .filter(
+                VehicleLiveState.vehicle_id == vehicle_id
+            )
+            .first()
+        )
+
+
+        if db_state:
+
+            previous_state = {
+                "progress": db_state.progress,
+                "movement_state": db_state.movement_state,
+                "next_stop_id": db_state.next_stop_id,
+                "stop_sequence": db_state.stop_sequence,
+                "current_delay": db_state.current_delay,
+
+                "segment_id": db_state.segment_id,
+                "segment_progress": db_state.segment_progress,
+                "distance_to_next_stop": db_state.distance_to_next_stop,
+                "speed": db_state.speed
+            }
+
+        else:
+            previous_state = None
 
         route_id = observation["route_id"]
         direction_id=observation["direction"]
@@ -60,13 +86,7 @@ def process_observation_pipeline(
             )
 
         route_reference = route_cache[cache_key]
-        """
-
-        if route_id not in route_cache:
-            route_cache[route_id] = load_route_reference(route_id,direction_id)
-
-        route_reference = route_cache[route_id]
-        """
+ 
 
         print("ROUTE:", route_reference["route_id"])
         # --- KHALED EDIT START ---
@@ -227,12 +247,29 @@ def process_observation_pipeline(
             )
             db.add(db_state)
 
-        # --- KHALED EDIT START ---
         # Keep the in-memory cache in sync so the NEXT observation
         # for this vehicle hits the cache instead of the DB.
         if vehicle_state_cache is not None:
             vehicle_state_cache[vehicle_id] = db_state
-        # --- KHALED EDIT END ---
+
+        # -----------------------------------
+        # STORE VEHICLE STATE HISTORY
+        # -----------------------------------
+        history_state = VehicleStateHistory(
+            vehicle_id=state["vehicle_id"],
+            route_id=state["route_id"],
+            direction=state["direction"],
+            timestamp=state["timestamp"],
+            segment_id=state["segment_id"],
+            segment_progress=state["segment_progress"],
+            speed=state["speed"],
+            movement_state=state["movement_state"],
+            stop_sequence=state["stop_sequence"],
+            confidence=state["confidence"],
+            source=state["source"],
+            simulation_flag=state["simulation_flag"]
+        )
+        db.add(history_state)
 
         print(
     "DB NEW OBJECTS:",
@@ -245,6 +282,8 @@ def process_observation_pipeline(
     except IntegrityError as e:
         db.rollback()
         print("DUPLICATE OBSERVATION SKIPPED:", e)
+        print("[DUPLICATE OBSERVATION]")
+        print("Existing vehicle/timestamp detected")
         return None
 
 
@@ -253,10 +292,9 @@ def process_observation_pipeline(
         print("PIPELINE ERROR:", e)
         raise
     finally:
-        # --- KHALED EDIT START ---
         if owns_session:
             db.close()
-        # --- KHALED EDIT END ---
+    state["events"] = final_events    
 
     return state
 
