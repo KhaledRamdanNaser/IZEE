@@ -1,0 +1,21 @@
+{
+"scenario_name": "BetweenStopsMovementProcessing",
+"vehicle_id": "V_Engine_Between_99",
+"expected_behavior": [
+"between_stops",
+"segment_progress_calculated",
+"next_stop_identified"
+],
+"observations": [
+{
+"vehicle_id": "V_Engine_Between_99",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T12:00:00",
+"lat": 30.0301356,
+"lon": 31.2402126,
+"speed": 35.5,
+"bearing": 56
+}
+]
+}

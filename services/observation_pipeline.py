@@ -66,23 +66,6 @@ def process_observation_pipeline(
         print("ROUTE:", route_reference["route_id"])
         db.add(db_observation)
 
-        # 1️⃣ Load previous state
-        db_state = (
-            db.query(VehicleLiveState)
-            .filter(VehicleLiveState.vehicle_id == vehicle_id)
-            .first()
-        )
-
-        previous_state = None
-
-        if db_state:
-            previous_state = {
-                "progress": db_state.progress,
-                "movement_state": db_state.movement_state,
-                "next_stop_id": db_state.next_stop_id,
-                "stop_sequence": db_state.stop_sequence,
-                "current_delay": db_state.current_delay 
-            }
 
         # 2️⃣ Process observation
         state = process_observation(
@@ -219,7 +202,7 @@ def process_observation_pipeline(
 
             route_id=state["route_id"],
 
-            direction=state["direction"],
+            direction = observation["direction"],
 
             timestamp=state["timestamp"],
 

@@ -1,0 +1,31 @@
+{
+"scenario_name": "GPSNoiseTransitionProtection",
+"vehicle_id": "V_Engine_Noise_55",
+"expected_behavior": [
+"between_stops",
+"false_transition_rejected",
+"between_stops"
+],
+"observations": [
+{
+"vehicle_id": "V_Engine_Noise_55",
+"route_id": "CTA_M_112",
+"direction":0,
+"timestamp":"2026-06-18T12:40:00",
+"lat":30.0301356,
+"lon":31.2402126,
+"speed":30,
+"bearing":56
+},
+{
+"vehicle_id": "V_Engine_Noise_55",
+"route_id":"CTA_M_112",
+"direction":0,
+"timestamp":"2026-06-18T12:40:30",
+"lat":30.0317500,
+"lon":31.2425500,
+"speed":1.5,
+"bearing":57
+}
+]
+}

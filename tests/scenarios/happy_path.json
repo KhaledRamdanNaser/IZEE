@@ -1,6 +1,6 @@
 {
 "scenario_name": "HappyPathFullTraversal",
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "expected_behavior": [
 "at_stop",
 "stop_departure",
@@ -12,7 +12,7 @@
 ],
 "observations": [
 {
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "route_id": "CTA_M_112",
 "direction": 0,
 "timestamp": "2026-05-28T21:00:00",
@@ -22,7 +22,7 @@
 "bearing": 55
 },
 {
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "route_id": "CTA_M_112",
 "direction": 0,
 "timestamp": "2026-05-28T21:00:45",
@@ -32,7 +32,7 @@
 "bearing": 55
 },
 {
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "route_id": "CTA_M_112",
 "direction": 0,
 "timestamp": "2026-05-28T21:01:30",
@@ -42,7 +42,7 @@
 "bearing": 56
 },
 {
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "route_id": "CTA_M_112",
 "direction": 0,
 "timestamp": "2026-05-28T21:02:10",
@@ -52,7 +52,7 @@
 "bearing": 57
 },
 {
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "route_id": "CTA_M_112",
 "direction": 0,
 "timestamp": "2026-05-28T21:02:35",
@@ -62,7 +62,7 @@
 "bearing": 57
 },
 {
-"vehicle_id": "BusEE_HappyPath_Test_Run01",
+"vehicle_id": "BusEE_HappyPath_Test_Run004",
 "route_id": "CTA_M_112",
 "direction": 0,
 "timestamp": "2026-05-28T21:03:00",

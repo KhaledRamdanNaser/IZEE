@@ -2,3 +2,5 @@
 *.pyc
 .venv/
 venv/
+# Exclude large raw and converted data sets
+data_salah/

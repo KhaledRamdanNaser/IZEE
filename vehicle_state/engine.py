@@ -8,6 +8,67 @@ from vehicle_state.validation import validate_vehicle_state
 from vehicle_state.transition_tracker import (
     update_operational_memory
 )
+# --- SALAH EDIT START ---
+
+def stabilize_segment(
+    matched_segment,
+    previous_state,
+    segments
+):
+    print("🔥🔥🔥 STABILIZE_SEGMENT CALLED 🔥🔥🔥")
+    """
+    Prevent segment bouncing near boundaries.
+    """
+    # ⬇️ ADDED  Debugging PRINTS HERE ⬇️
+    print("===== SEGMENT STABILIZER =====")
+    print("candidate:", matched_segment["segment_id"])  # Changed candidate_segment to matched_segment
+
+    if previous_state:
+        print("previous:", previous_state.get("segment_id"))
+        print("previous progress:", previous_state.get("segment_progress"))
+    else:
+        print("previous: NONE")
+    # ⬆️ END OF ADDED PRINTS ⬆️
+
+    if previous_state is None:
+        return matched_segment
+
+    previous_segment_id = previous_state.get("segment_id")
+
+    if previous_segment_id is None:
+        return matched_segment
+
+    matched_id = (
+        matched_segment["start"]["stop_id"]
+        + "_"
+        + matched_segment["end"]["stop_id"]
+    )
+
+    if matched_id == previous_segment_id:
+        return matched_segment
+
+    previous_progress = previous_state.get(
+        "segment_progress",
+        1
+    )
+
+    # vehicle has not finished current segment yet
+    if previous_progress < 0.90:
+
+        for seg in segments:
+            sid = (
+                seg["start"]["stop_id"]
+                + "_"
+                + seg["end"]["stop_id"]
+            )
+
+            if sid == previous_segment_id:
+                return seg
+
+    return matched_segment
+# --- SALAH EDIT END ---
+
+
 def process_observation(observation, previous_state, route_reference):
 
     # 1️⃣ Extract GPS
@@ -15,7 +76,17 @@ def process_observation(observation, previous_state, route_reference):
     lon = observation["location"]["lon"]
 
     # 2️⃣ Find nearest segment
-    segment = find_nearest_segment(lat, lon, route_reference["segments"])
+    matched_segment = find_nearest_segment(
+        lat,
+        lon,
+        route_reference["segments"]
+    )
+
+    segment = stabilize_segment(
+        matched_segment,
+        previous_state,
+        route_reference["segments"]
+    )
     print("MATCHED SEGMENT:", segment)
     
     segments = route_reference["segments"]

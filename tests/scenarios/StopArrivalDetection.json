@@ -1,0 +1,30 @@
+{
+"scenario_name": "StopArrivalDetection",
+"vehicle_id": "V_Engine_Arrival_77",
+"expected_behavior": [
+"approaching_stop",
+"at_stop"
+],
+"observations": [
+{
+"vehicle_id": "V_Engine_Arrival_77",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T12:20:00",
+"lat": 30.0317500,
+"lon": 31.2425500,
+"speed": 18.0,
+"bearing": 57
+},
+{
+"vehicle_id": "V_Engine_Arrival_77",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T12:20:25",
+"lat": 30.0320463,
+"lon": 31.2430053,
+"speed": 2.0,
+"bearing": 58
+}
+]
+}

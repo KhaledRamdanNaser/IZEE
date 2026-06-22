@@ -1,0 +1,41 @@
+{
+"scenario_name": "DepartureTransitionValidation_Run03",
+"vehicle_id": "V_Engine_Depart_03_Final",
+"expected_behavior": [
+"at_stop",
+"at_stop",
+"leaving_stop"
+],
+"observations": [
+{
+"vehicle_id": "V_Engine_Depart_03_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T21:15:00",
+"lat": 30.0332300,
+"lon": 31.2456880,
+"speed": 0.0,
+"bearing": 42
+},
+{
+"vehicle_id": "V_Engine_Depart_03_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T21:15:15",
+"lat": 30.0333200,
+"lon": 31.2458000,
+"speed": 3.5,
+"bearing": 42
+},
+{
+"vehicle_id": "V_Engine_Depart_03_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T21:15:40",
+"lat": 30.0345000,
+"lon": 31.2470000,
+"speed": 19.0,
+"bearing": 40
+}
+]
+}

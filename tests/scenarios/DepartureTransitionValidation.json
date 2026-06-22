@@ -1,0 +1,30 @@
+{
+"scenario_name": "DepartureTransitionValidation",
+"vehicle_id": "V_Engine_Depart_66",
+"expected_behavior": [
+"at_stop",
+"leaving_stop"
+],
+"observations": [
+{
+"vehicle_id": "V_Engine_Depart_66",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T12:30:00",
+"lat": 30.0282248,
+"lon": 31.2374198,
+"speed": 0.0,
+"bearing": 55
+},
+{
+"vehicle_id": "V_Engine_Depart_66",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T12:30:45",
+"lat": 30.0301356,
+"lon": 31.2402126,
+"speed": 25,
+"bearing": 56
+}
+]
+}

@@ -1,0 +1,52 @@
+{
+"scenario_name": "GPSNoiseTransitionProtection_Run02",
+"vehicle_id": "V_Engine_Noise_02_Final",
+"expected_behavior": [
+"between_stops",
+"approaching_stop",
+"approaching_stop",
+"approaching_stop"
+],
+"observations": [
+{
+"vehicle_id": "V_Engine_Noise_02_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T22:25:00",
+"lat": 30.0301356,
+"lon": 31.2402126,
+"speed": 35.0,
+"bearing": 56
+},
+{
+"vehicle_id": "V_Engine_Noise_02_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T22:25:20",
+"lat": 30.0314731,
+"lon": 31.2421675,
+"speed": 22.0,
+"bearing": 57
+},
+{
+"vehicle_id": "V_Engine_Noise_02_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T22:25:30",
+"lat": 30.0320100,
+"lon": 31.2429800,
+"speed": 1.0,
+"bearing": 58
+},
+{
+"vehicle_id": "V_Engine_Noise_02_Final",
+"route_id": "CTA_M_112",
+"direction": 0,
+"timestamp": "2026-06-18T22:25:40",
+"lat": 30.0318115,
+"lon": 31.2426639,
+"speed": 18.0,
+"bearing": 57
+}
+]
+}
