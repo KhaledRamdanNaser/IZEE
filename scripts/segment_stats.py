@@ -268,6 +268,10 @@ def fetch_segment_completed_rows(db):
             (metrics->>'travel_time')::float AS travel_time
         FROM transit_events
         WHERE event_type = 'segment_completed'
+        AND COALESCE(
+            (metrics->>'bootstrap')::boolean,
+            false
+        ) = false
         AND (metrics->>'travel_time') IS NOT NULL
         AND (metrics->>'travel_time')::float > 30
         AND (metrics->>'travel_time')::float < 3600

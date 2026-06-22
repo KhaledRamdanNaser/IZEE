@@ -1,4 +1,5 @@
-# event_engine/traversal_lifecycle.py
+1.event_engine/traversal_lifecycle.py:{
+    # event_engine/traversal_lifecycle.py
 
 from datetime import datetime
 
@@ -91,17 +92,10 @@ def process_traversal_lifecycle(
                     "segment_id":
                         stored_segment,
 
-                   "metrics": {
+                    "metrics": {
                         "travel_time": travel_time,
                         "completion_method":
-                            "segment_transition",
-
-                        # --- SALAH EDIT START ---
-                        "bootstrap": active_traversal.get(
-                            "bootstrap",
-                            False
-                        )
-                        # --- SALAH EDIT END ---
+                            "segment_transition"
                     }
                 }
 
@@ -231,8 +225,7 @@ def process_traversal_lifecycle(
                 vehicle_id,
                 origin_stop_id,
                 current_state.get("timestamp"),
-                current_state.get("segment_id"),
-                bootstrap=True
+                current_state.get("segment_id")
             )
 
     for event in events:
@@ -345,14 +338,7 @@ def process_traversal_lifecycle(
 
                     "metrics": {
                         "travel_time": travel_time,
-                        "completion_method": "stop_arrival",
-
-                        # --- SALAH EDIT START ---
-                        "bootstrap": stored.get(
-                            "bootstrap",
-                            False
-                        )
-                        # --- SALAH EDIT END ---
+                        "completion_method": "stop_arrival"
                     }
                 }
 
@@ -375,3 +361,4 @@ def process_traversal_lifecycle(
 
 
     return generated_events
+}

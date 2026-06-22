@@ -20,7 +20,8 @@ def start_traversal(
     vehicle_id,
     from_stop_id,
     departure_time,
-    segment_id
+    segment_id,
+    bootstrap=False
 ):
     """
     Start active traversal lifecycle.
@@ -29,7 +30,11 @@ def start_traversal(
     active_traversals[vehicle_id] = {
         "from_stop_id": from_stop_id,
         "departure_time": departure_time,
-        "segment_id": segment_id
+        "segment_id": segment_id,
+
+        # --- SALAH EDIT START ---
+        "bootstrap": bootstrap
+        # --- SALAH EDIT END ---
     }
 
 

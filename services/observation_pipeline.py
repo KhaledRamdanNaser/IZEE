@@ -6,6 +6,8 @@ from event_engine.engine import process_event
 from models.transit_event import TransitEvent
 from models.vehicle_live_state import VehicleLiveState
 from models.vehicle_state_history import VehicleStateHistory
+from event_engine.event_validator import validate_event
+
 
 route_cache = {}
 
@@ -34,6 +36,7 @@ def process_observation_pipeline(
             previous_state = {
                 "progress": db_state.progress,
                 "movement_state": db_state.movement_state,
+                "current_stop_id": db_state.current_stop_id,
                 "next_stop_id": db_state.next_stop_id,
                 "stop_sequence": db_state.stop_sequence,
                 "current_delay": db_state.current_delay,
@@ -114,6 +117,12 @@ def process_observation_pipeline(
         print("STATE:", state["movement_state"])
         # 🔥 6️⃣ STORE EVENTS IN DB (ADD HERE)
         for event in final_events:
+
+            # --- SALAH EDIT START ---
+            if not validate_event(event):
+                continue
+            # --- SALAH EDIT END ---
+
             print("ADDING EVENT:", event["event_type"])
             db_event = TransitEvent(
                 
