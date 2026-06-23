@@ -15,21 +15,40 @@ last_transition_per_vehicle = {}
 
 def process_observation_pipeline(
     observation,
-    db_observation
+    db_observation=None,
+    db=None,
+    vehicle_state_cache=None,
+    persist_observation=True
 ):
     vehicle_id = observation["vehicle_id"]
-    db = SessionLocal()
+    # --- SALAH EDIT START ---
 
+    own_db_session = False
+
+    if db is None:
+        db = SessionLocal()
+        own_db_session = True
+
+    # --- SALAH EDIT END ---
     final_events = []   # ADD THIS
     try:
-        db_state = (
-            db.query(VehicleLiveState)
-            .filter(
-                VehicleLiveState.vehicle_id == vehicle_id
-            )
-            .first()
-        )
+        # --- SALAH EDIT START ---
+        # Bulk replay optimization:
+        # use in-memory live state cache when provided
 
+        if vehicle_state_cache is not None:
+            db_state = vehicle_state_cache.get(vehicle_id)
+
+        else:
+            db_state = (
+                db.query(VehicleLiveState)
+                .filter(
+                    VehicleLiveState.vehicle_id == vehicle_id
+                )
+                .first()
+            )
+
+        # --- SALAH EDIT END ---
 
         if db_state:
 
@@ -67,7 +86,13 @@ def process_observation_pipeline(
  
 
         print("ROUTE:", route_reference["route_id"])
-        db.add(db_observation)
+        
+        # --- SALAH EDIT START ---
+
+        if persist_observation:
+            db.add(db_observation)
+
+        # --- SALAH EDIT END ---
 
 
         # 2️⃣ Process observation
@@ -200,6 +225,12 @@ def process_observation_pipeline(
                 simulation_flag=state["simulation_flag"]
             )
             db.add(db_state)
+        # --- SALAH EDIT START ---
+        # Keep bulk replay live-state cache synchronized.
+        # Prevent duplicate VehicleLiveState inserts inside one batch.
+        if vehicle_state_cache is not None:
+            vehicle_state_cache[vehicle_id] = db_state
+        # --- SALAH EDIT END ---            
 
         # -----------------------------------
         # STORE VEHICLE STATE HISTORY
@@ -244,7 +275,8 @@ def process_observation_pipeline(
     "DB NEW OBJECTS:",
     len(db.new)
      )
-        db.commit()
+        if own_db_session:
+            db.commit()
     except IntegrityError as e:
         db.rollback()
         print("DUPLICATE OBSERVATION SKIPPED:", e)
@@ -254,11 +286,19 @@ def process_observation_pipeline(
 
 
     except Exception as e:
-        db.rollback()
+
+        # --- SALAH EDIT START ---
+        # Only rollback sessions created by this function.
+        # Bulk replay owns its transaction externally.
+        if own_db_session:
+            db.rollback()
+        # --- SALAH EDIT END ---
+
         print("PIPELINE ERROR:", e)
         raise
-    finally:    
-        db.close()
+    finally:   
+        if own_db_session: 
+            db.close()
     state["events"] = final_events    
 
     return state
