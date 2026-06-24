@@ -8,7 +8,7 @@ from routing.nearest_stop_search import haversine_meters
 OSRM_BASE_URL = os.getenv("OSRM_BASE_URL", "https://router.project-osrm.org")
 OSRM_PROFILES = [
     profile.strip()
-    for profile in os.getenv("OSRM_PROFILES", "foot,walking,driving").split(",")
+    for profile in os.getenv("OSRM_PROFILES", "foot").split(",")
     if profile.strip()
 ]
 OSRM_TIMEOUT_SECONDS = float(os.getenv("OSRM_TIMEOUT_SECONDS", "2"))

@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
@@ -19,6 +21,52 @@ const ink = Color(0xFF0F172A);
 const muted = Color(0xFF64748B);
 const softLine = Color(0xFFE5E7EB);
 const rose = Color(0xFFE11D48);
+
+/// Keeps the searched passenger journey authoritative while allowing the
+/// route-details response to supply fields that were not present in it.
+Map<String, dynamic> mergeSelectedRouteWithDetails(
+  Map<String, dynamic> selectedRoute,
+  Map<String, dynamic> routeDetails,
+) {
+  final merged = Map<String, dynamic>.from(routeDetails);
+  for (final entry in selectedRoute.entries) {
+    if (entry.value != null) merged[entry.key] = entry.value;
+  }
+  return merged;
+}
+
+bool isActiveLiveVehicle(
+  Map<String, dynamic> vehicle, {
+  DateTime? now,
+}) {
+  final status = (vehicle['location_status'] ?? vehicle['status'])
+      ?.toString()
+      .toLowerCase();
+  if (status != null && status.isNotEmpty) return status == 'active';
+
+  final rawTimestamp =
+      vehicle['last_updated'] ?? vehicle['last_update'] ?? vehicle['timestamp'];
+  final timestamp = DateTime.tryParse(rawTimestamp?.toString() ?? '');
+  if (timestamp == null) return false;
+  final age = (now ?? DateTime.now().toUtc()).toUtc().difference(timestamp.toUtc());
+  return !age.isNegative && age <= const Duration(seconds: 60);
+}
+
+String estimateNextStopDuration({
+  required double distanceMeters,
+  required bool locationAvailable,
+  String? stepType,
+  num? fallbackSeconds,
+}) {
+  if (!locationAvailable) {
+    return fallbackSeconds == null
+        ? '-- min'
+        : '${math.max(1, (fallbackSeconds / 60).ceil())} min';
+  }
+  if (distanceMeters <= 30) return '<1 min';
+  final metersPerSecond = stepType == 'walk' ? 1.4 : 8.33;
+  return '${math.max(1, (distanceMeters / metersPerSecond / 60).ceil())} min';
+}
 
 IconData iconForMode(String mode) {
   final normalized = mode.toLowerCase();
@@ -84,8 +132,10 @@ enum AppScreen {
   wallet,
   notifications,
   profile,
+  settings,
   favorites,
   tripHistory,
+  reportIncident,
 }
 
 class PlanTripSession {
@@ -95,11 +145,14 @@ class PlanTripSession {
   Map<String, double>? selectedDestination;
   Map<String, dynamic>? routeResponse;
   String? errorMessage;
-  String selectedDepartureTime = 'now';
+  String selectedDepartureTime = '08:00:00';
   String? lastSearchRequest;
   bool loadingRoutes = false;
   final Map<String, List<Map<String, dynamic>>> geocodeCache = {};
   final List<RecentTripSearch> recentSearches = [];
+  final List<FavoriteTrip> favoriteSearches = [];
+  bool isLeaveNow = true;
+  DateTime? selectedDepartureDateTime;
 }
 
 class RecentTripSearch {
@@ -110,6 +163,24 @@ class RecentTripSearch {
     required this.destination,
   });
 
+  final String originText;
+  final String destinationText;
+  final Map<String, double> origin;
+  final Map<String, double> destination;
+
+  String get label => '$originText -> $destinationText';
+}
+
+class FavoriteTrip {
+  const FavoriteTrip({
+    required this.routeId,
+    required this.originText,
+    required this.destinationText,
+    required this.origin,
+    required this.destination,
+  });
+
+  final String routeId;
   final String originText;
   final String destinationText;
   final Map<String, double> origin;
@@ -151,9 +222,116 @@ class _AppShellState extends State<AppShell> {
   Map<String, dynamic>? selectedRoute;
   final PlanTripSession planTripSession = PlanTripSession();
   late final AppServices services = AppServices();
+  String? activeRouteId;
+  String? activeVehicleId;
+  Timer? _notifTimer;
+  final Set<String> _shownNotificationIds = {};
+  int _unreadCount = 0;
+  bool _serviceNotificationsEnabled = true;
+  bool _liveVehicleUpdatesEnabled = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _startNotificationPolling();
+  }
+
+  void _startNotificationPolling() {
+    _notifTimer?.cancel();
+    if (!_serviceNotificationsEnabled) return;
+    _notifTimer = Timer.periodic(const Duration(seconds: 10), (_) => _pollNotifications());
+  }
+
+  Future<void> _pollNotifications() async {
+    if (!_serviceNotificationsEnabled) return;
+    if (screen == AppScreen.splash || screen == AppScreen.auth) return;
+    try {
+      final res = await services.loadNotifications();
+      final List<dynamic> notifs = res['notifications'] ?? [];
+      
+      int currentUnread = 0;
+      bool hasNewAlert = false;
+      String? alertTitle;
+      String? alertBody;
+
+      for (final n in notifs) {
+        final id = n['id']?.toString();
+        final unread = n['unread'] as bool? ?? false;
+        if (unread) {
+          currentUnread++;
+          if (id != null && !_shownNotificationIds.contains(id)) {
+            _shownNotificationIds.add(id);
+            hasNewAlert = true;
+            alertTitle = n['title']?.toString();
+            alertBody = n['body']?.toString();
+          }
+        }
+      }
+
+      if (mounted) {
+        setState(() {
+          _unreadCount = currentUnread;
+        });
+
+        if (hasNewAlert && alertBody != null) {
+          showPremiumAlert(
+            context,
+            alertTitle != null ? '$alertTitle\n\n$alertBody' : alertBody,
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Error polling passenger notifications: $e');
+    }
+  }
+
+  Future<void> _loadFavoritesFromBackend() async {
+    try {
+      final favList = await services.loadFavorites();
+      if (mounted) {
+        setState(() {
+          planTripSession.favoriteSearches.clear();
+          for (final f in favList) {
+            final originLat = f['origin_lat'];
+            final originLon = f['origin_lon'];
+            final destLat = f['destination_lat'];
+            final destLon = f['destination_lon'];
+            final routeId = f['route_id']?.toString() ?? '';
+            if (originLat != null && originLon != null && destLat != null && destLon != null) {
+              planTripSession.favoriteSearches.add(FavoriteTrip(
+                routeId: routeId,
+                originText: f['origin_name']?.toString() ?? 'Origin',
+                destinationText: f['destination_name']?.toString() ?? 'Destination',
+                origin: {'lat': (originLat as num).toDouble(), 'lon': (originLon as num).toDouble()},
+                destination: {'lat': (destLat as num).toDouble(), 'lon': (destLon as num).toDouble()},
+              ));
+            }
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint('Failed to load favorites from backend: $e');
+    }
+  }
+
+  String? _routeId(Map<String, dynamic>? route) {
+    final direct = route?['route_id']?.toString();
+    if (direct != null && direct.isNotEmpty && direct != 'null') return direct;
+    final legs = route?['legs'];
+    if (legs is List) {
+      for (final leg in legs.whereType<Map<String, dynamic>>()) {
+        final mode = (leg['mode'] ?? '').toString().toLowerCase();
+        if (mode == 'bus' || mode == 'metro') {
+          return (leg['route_label'] ?? leg['route_id'] ?? '').toString();
+        }
+      }
+    }
+    return null;
+  }
 
   @override
   void dispose() {
+    _notifTimer?.cancel();
     services.dispose();
     super.dispose();
   }
@@ -170,6 +348,15 @@ class _AppShellState extends State<AppShell> {
     setState(() => menuOpen = open);
   }
 
+  void _setServiceNotifications(bool enabled) {
+    setState(() {
+      _serviceNotificationsEnabled = enabled;
+      if (!enabled) _unreadCount = 0;
+    });
+    _startNotificationPolling();
+    if (enabled) _pollNotifications();
+  }
+
   Future<bool> connect(
     String action,
     Future<Map<String, dynamic>> Function() request, {
@@ -178,19 +365,16 @@ class _AppShellState extends State<AppShell> {
     try {
       await request();
       if (!quiet && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$action connected')),
-        );
+        showPremiumAlert(context, '$action successfully completed!');
       }
       return true;
     } catch (error) {
+      print('CONNECT_ACTION_ERROR ($action): $error');
       if (!quiet && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '$action is ready, but the backend did not respond yet.',
-            ),
-          ),
+        showPremiumAlert(
+          context,
+          '$action is ready, but the backend did not respond yet.',
+          isError: true,
         );
       }
       return false;
@@ -255,7 +439,11 @@ class _AppShellState extends State<AppShell> {
         return AuthScreen(
           services: services,
           connect: connect,
-          onDone: () => go(AppScreen.home),
+          onDone: () {
+            go(AppScreen.home);
+            _pollNotifications();
+            _loadFavoritesFromBackend();
+          },
         );
       case AppScreen.home:
         return HomeScreen(
@@ -265,6 +453,8 @@ class _AppShellState extends State<AppShell> {
           onGo: go,
           onRouteSelected: (route) => selectedRoute = route,
           selectedRoute: selectedRoute,
+          unreadCount: _unreadCount,
+          liveUpdatesEnabled: _liveVehicleUpdatesEnabled,
         );
       case AppScreen.planTrip:
         return PlanTripScreen(
@@ -283,6 +473,12 @@ class _AppShellState extends State<AppShell> {
           connect: connect,
           onGo: go,
           route: selectedRoute,
+          onNavigationUpdate: (routeId, vehicleId) {
+            setState(() {
+              activeRouteId = routeId;
+              activeVehicleId = vehicleId;
+            });
+          },
         );
       case AppScreen.wallet:
         return WalletScreen(
@@ -298,6 +494,7 @@ class _AppShellState extends State<AppShell> {
           services: services,
           connect: connect,
           onGo: go,
+          onNotificationsChanged: _pollNotifications,
         );
       case AppScreen.profile:
         return ProfileScreen(
@@ -305,17 +502,55 @@ class _AppShellState extends State<AppShell> {
           connect: connect,
           onGo: go,
         );
-      case AppScreen.favorites:
-        return SimpleListScreen(
-          title: 'Favorites',
-          emptyText: 'No favorite places yet',
+      case AppScreen.settings:
+        return PassengerSettingsScreen(
+          notificationsEnabled: _serviceNotificationsEnabled,
+          liveVehicleUpdatesEnabled: _liveVehicleUpdatesEnabled,
+          onNotificationsChanged: _setServiceNotifications,
+          onLiveVehicleUpdatesChanged: (enabled) {
+            setState(() => _liveVehicleUpdatesEnabled = enabled);
+          },
+          onClearRecentSearches: () {
+            setState(() => planTripSession.recentSearches.clear());
+          },
           onBack: () => go(AppScreen.home),
+        );
+      case AppScreen.favorites:
+        return FavoritesScreen(
+          session: planTripSession,
+          onBack: () => go(AppScreen.home),
+          onDeleteFavorite: (fav) async {
+            try {
+              await services.deleteFavorite(fav.routeId);
+            } catch (e) {
+              debugPrint('Failed to delete favorite from backend: $e');
+            }
+          },
+          onSelectFavorite: (fav) {
+            planTripSession.originText = fav.originText;
+            planTripSession.destinationText = fav.destinationText;
+            planTripSession.selectedOrigin = Map<String, double>.from(fav.origin);
+            planTripSession.selectedDestination = Map<String, double>.from(fav.destination);
+            planTripSession.errorMessage = null;
+            planTripSession.loadingRoutes = true;
+            planTripSession.lastSearchRequest = fav.label;
+            planTripSession.routeResponse = null;
+            go(AppScreen.planTrip);
+          },
         );
       case AppScreen.tripHistory:
         return SimpleListScreen(
           title: 'Trip History',
           emptyText: 'No completed trips yet',
           onBack: () => go(AppScreen.home),
+        );
+      case AppScreen.reportIncident:
+        return ReportIncidentScreen(
+          services: services,
+          connect: connect,
+          onGo: go,
+          prefilledRouteId: activeRouteId ?? (selectedRoute != null ? _routeId(selectedRoute) : null),
+          prefilledVehicleId: activeVehicleId,
         );
     }
   }
@@ -696,10 +931,6 @@ class MenuOverlay extends StatelessWidget {
                             ),
                             const SizedBox(height: 28),
                             MenuItem(
-                              label: 'My Trips',
-                              onTap: () => _go(AppScreen.tripHistory),
-                            ),
-                            MenuItem(
                               label: 'Favorites',
                               onTap: () => _go(AppScreen.favorites),
                             ),
@@ -708,12 +939,16 @@ class MenuOverlay extends StatelessWidget {
                               onTap: () => _go(AppScreen.tripHistory),
                             ),
                             MenuItem(
+                              label: 'Report Incident',
+                              onTap: () => _go(AppScreen.reportIncident),
+                            ),
+                            MenuItem(
                               label: 'Help & Support',
                               onTap: () => _go(AppScreen.notifications),
                             ),
                             MenuItem(
                               label: 'Settings',
-                              onTap: () => _go(AppScreen.profile),
+                              onTap: () => _go(AppScreen.settings),
                             ),
                             const Spacer(),
                             const Text(
@@ -743,6 +978,8 @@ class HomeScreen extends StatefulWidget {
     required this.onGo,
     required this.onRouteSelected,
     required this.selectedRoute,
+    required this.liveUpdatesEnabled,
+    this.unreadCount = 0,
   });
 
   final AppServices services;
@@ -751,6 +988,8 @@ class HomeScreen extends StatefulWidget {
   final ValueChanged<AppScreen> onGo;
   final ValueChanged<Map<String, dynamic>> onRouteSelected;
   final Map<String, dynamic>? selectedRoute;
+  final bool liveUpdatesEnabled;
+  final int unreadCount;
 
   @override
   State<HomeScreen> createState() => _HomeScreenState();
@@ -762,10 +1001,31 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _loadingVehicles = true;
   String? _vehicleError;
 
+  final MapController _mapController = MapController();
+  StreamSubscription<Position>? _positionSubscription;
+  LatLng? _userLocation;
+  double? _userHeading;
+  bool _followUser = false;
+
   @override
   void initState() {
     super.initState();
     _loadLiveVehicles();
+    _updateRefreshTimer();
+    _initLocationTracking();
+  }
+
+  @override
+  void didUpdateWidget(covariant HomeScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.liveUpdatesEnabled != widget.liveUpdatesEnabled) {
+      _updateRefreshTimer();
+    }
+  }
+
+  void _updateRefreshTimer() {
+    _refreshTimer?.cancel();
+    if (!widget.liveUpdatesEnabled) return;
     _refreshTimer = Timer.periodic(
       const Duration(seconds: 10),
       (_) => _loadLiveVehicles(quiet: true),
@@ -775,7 +1035,50 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     _refreshTimer?.cancel();
+    _positionSubscription?.cancel();
     super.dispose();
+  }
+
+  Future<void> _initLocationTracking() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return;
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        return;
+      }
+      
+      final initialPos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      if (mounted) {
+        setState(() {
+          _userLocation = LatLng(initialPos.latitude, initialPos.longitude);
+          _userHeading = initialPos.heading;
+        });
+      }
+
+      _positionSubscription = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 3,
+        ),
+      ).listen((Position position) {
+        if (!mounted) return;
+        setState(() {
+          _userLocation = LatLng(position.latitude, position.longitude);
+          _userHeading = position.heading;
+        });
+        if (_followUser) {
+          _mapController.move(_userLocation!, _mapController.camera.zoom);
+        }
+      });
+    } catch (e) {
+      debugPrint('Error starting location tracking: $e');
+    }
   }
 
   Future<void> _loadLiveVehicles({bool quiet = false}) async {
@@ -790,7 +1093,10 @@ class _HomeScreenState extends State<HomeScreen> {
       final data = await widget.services.loadHome();
       final rawVehicles = data['data'] ?? data['vehicles'] ?? data['results'];
       final parsed = rawVehicles is List
-          ? rawVehicles.whereType<Map<String, dynamic>>().toList()
+          ? rawVehicles
+              .whereType<Map<String, dynamic>>()
+              .where(isActiveLiveVehicle)
+              .toList()
           : <Map<String, dynamic>>[];
 
       if (!mounted) return;
@@ -848,11 +1154,12 @@ class _HomeScreenState extends State<HomeScreen> {
                                 color: Colors.white,
                               ),
                             ),
-                            Positioned(
-                              top: 4,
-                              right: 6,
-                              child: _Badge(text: '3'),
-                            ),
+                            if (widget.unreadCount > 0)
+                              Positioned(
+                                top: 4,
+                                right: 6,
+                                child: _Badge(text: widget.unreadCount.toString()),
+                              ),
                           ],
                         ),
                       ],
@@ -872,6 +1179,16 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: RouteMapPreview(
                       route: widget.selectedRoute,
                       liveVehicles: liveVehicles,
+                      userLocation: _userLocation,
+                      userHeading: _userHeading,
+                      mapController: _mapController,
+                      onPositionChanged: (position, hasGesture) {
+                        if (hasGesture) {
+                          setState(() {
+                            _followUser = false;
+                          });
+                        }
+                      },
                     ),
                   ),
                   Positioned(
@@ -880,7 +1197,16 @@ class _HomeScreenState extends State<HomeScreen> {
                     child: _CircleButton(
                       icon: Icons.my_location,
                       color: green,
-                      onTap: () {},
+                      onTap: () {
+                        if (_userLocation != null) {
+                          setState(() {
+                            _followUser = true;
+                          });
+                          _mapController.move(_userLocation!, 15.0);
+                        } else {
+                          _initLocationTracking();
+                        }
+                      },
                     ),
                   ),
                   Positioned(
@@ -892,7 +1218,16 @@ class _HomeScreenState extends State<HomeScreen> {
                         heroTag: 'locate',
                         backgroundColor: green,
                         foregroundColor: Colors.white,
-                        onPressed: () {},
+                        onPressed: () {
+                          if (_userLocation != null) {
+                            setState(() {
+                              _followUser = true;
+                            });
+                            _mapController.move(_userLocation!, 15.0);
+                          } else {
+                            _initLocationTracking();
+                          }
+                        },
                         child: const Icon(Icons.navigation),
                       ),
                     ),
@@ -945,14 +1280,12 @@ class _HomeScreenState extends State<HomeScreen> {
                       )
                     else if (_vehicleError != null)
                       LiveVehicleEmptyState(
-                        message:
-                            'Cannot load live vehicles. Check backend and adb reverse.',
+                        message: 'No nearby active buses',
                         onRetry: () => _loadLiveVehicles(),
                       )
                     else if (liveVehicles.isEmpty)
                       LiveVehicleEmptyState(
-                        message:
-                            'No live driver vehicles yet. Start Trip in the driver app.',
+                        message: 'No nearby active buses',
                         onRetry: () => _loadLiveVehicles(),
                       )
                     else
@@ -997,11 +1330,16 @@ class _HomeScreenState extends State<HomeScreen> {
       ],
     );
   }
-
   String _vehicleTitle(Map<String, dynamic> vehicle) {
-    return vehicle['vehicle_id']?.toString() ?? 'Live vehicle';
+    final routeName = vehicle['route_name'] ?? vehicle['route_label'];
+    if (routeName != null && routeName.toString().trim().isNotEmpty) {
+      return routeName.toString();
+    }
+    final routeId = vehicle['route_id'];
+    return routeId != null && routeId.toString().trim().isNotEmpty
+        ? routeId.toString()
+        : 'Route unavailable';
   }
-
   String _vehiclePlace(Map<String, dynamic> vehicle) {
     return 'Driver location update';
   }
@@ -1029,6 +1367,7 @@ class _HomeScreenState extends State<HomeScreen> {
     if (value == null) return null;
     return double.tryParse(value.toString());
   }
+
 }
 
 class LiveVehicleEmptyState extends StatelessWidget {
@@ -1120,6 +1459,18 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
         .addListener(() => _queueSuggestions(forOrigin: false));
     _originFocusNode.addListener(_handleFieldFocusChanged);
     _destinationFocusNode.addListener(_handleFieldFocusChanged);
+
+    if (widget.session.loadingRoutes &&
+        widget.session.selectedOrigin != null &&
+        widget.session.selectedDestination != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _submitSearch();
+      });
+    } else if (widget.session.selectedOrigin == null || widget.session.originText.isEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _useCurrentLocationAsOrigin();
+      });
+    }
   }
 
   @override
@@ -1133,6 +1484,19 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
     _originController.dispose();
     _destinationController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant PlanTripScreen oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    _suppressSuggestionLookup = true;
+    if (_originController.text != widget.session.originText) {
+      _originController.text = widget.session.originText;
+    }
+    if (_destinationController.text != widget.session.destinationText) {
+      _destinationController.text = widget.session.destinationText;
+    }
+    _suppressSuggestionLookup = false;
   }
 
   void _handleFieldFocusChanged() {
@@ -1148,53 +1512,93 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
     });
   }
 
-  Future<Map<String, dynamic>> _searchRoutes() async {
-    final origin = await _coordinatesFor(
-      selected: widget.session.selectedOrigin,
-      text: _originController.text,
-      fieldName: 'origin',
+  String _formatISO8601(DateTime dt) {
+    final y = dt.year.toString().padLeft(4, '0');
+    final m = dt.month.toString().padLeft(2, '0');
+    final d = dt.day.toString().padLeft(2, '0');
+    final h = dt.hour.toString().padLeft(2, '0');
+    final min = dt.minute.toString().padLeft(2, '0');
+    final s = dt.second.toString().padLeft(2, '0');
+    return '$y-$m-${d}T$h:$min:$s';
+  }
+
+  String _formatDisplayDateTime(DateTime? dt, {String fallback = 'Schedule'}) {
+    if (dt == null) return fallback;
+    final months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    final month = months[dt.month - 1];
+    final day = dt.day.toString();
+    final hour = dt.hour.toString().padLeft(2, '0');
+    final minute = dt.minute.toString().padLeft(2, '0');
+    return '$month $day, $hour:$minute';
+  }
+
+  Future<void> _handleScheduleTap() async {
+    print('SCHEDULE_CLICKED');
+    final DateTime now = DateTime.now();
+    final DateTime? pickedDate = await showDatePicker(
+      context: context,
+      initialDate: widget.session.selectedDepartureDateTime ?? now,
+      firstDate: now.subtract(const Duration(days: 30)),
+      lastDate: now.add(const Duration(days: 365)),
+      builder: (context, child) {
+        return Theme(
+          data: ThemeData.light().copyWith(
+            colorScheme: const ColorScheme.light(
+              primary: green,
+              onPrimary: Colors.white,
+              onSurface: ink,
+            ),
+          ),
+          child: child!,
+        );
+      },
     );
-    final destination = await _coordinatesFor(
-  int _destinationSuggestionRequest = 0;
+    if (pickedDate == null) return;
+    print('DATE_PICKER_SELECTED: ${_formatISO8601(pickedDate)}');
 
-  @override
-  void initState() {
-    super.initState();
-    _originController = TextEditingController(text: widget.session.originText);
-    _destinationController =
-        TextEditingController(text: widget.session.destinationText);
-    _originFocusNode = FocusNode();
-    _destinationFocusNode = FocusNode();
-    _originController.addListener(() => _queueSuggestions(forOrigin: true));
-    _destinationController
-        .addListener(() => _queueSuggestions(forOrigin: false));
-    _originFocusNode.addListener(_handleFieldFocusChanged);
-    _destinationFocusNode.addListener(_handleFieldFocusChanged);
-  }
-
-  @override
-  void dispose() {
-    _originDebounce?.cancel();
-    _destinationDebounce?.cancel();
-    _originFocusNode.removeListener(_handleFieldFocusChanged);
-    _destinationFocusNode.removeListener(_handleFieldFocusChanged);
-    _originFocusNode.dispose();
-    _destinationFocusNode.dispose();
-    _originController.dispose();
-    _destinationController.dispose();
-    super.dispose();
-  }
-
-  void _handleFieldFocusChanged() {
     if (!mounted) return;
+    final TimeOfDay? pickedTime = await showTimePicker(
+      context: context,
+      initialTime: widget.session.selectedDepartureDateTime != null
+          ? TimeOfDay.fromDateTime(widget.session.selectedDepartureDateTime!)
+          : TimeOfDay.now(),
+      builder: (context, child) {
+        return Theme(
+          data: ThemeData.light().copyWith(
+            colorScheme: const ColorScheme.light(
+              primary: green,
+              onPrimary: Colors.white,
+              onSurface: ink,
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+    if (pickedTime == null) return;
+    print('TIME_PICKER_SELECTED: ${pickedTime.hour.toString().padLeft(2, '0')}:${pickedTime.minute.toString().padLeft(2, '0')}:00');
+
+    final combined = DateTime(
+      pickedDate.year,
+      pickedDate.month,
+      pickedDate.day,
+      pickedTime.hour,
+      pickedTime.minute,
+    );
+
+    if (combined.isBefore(DateTime.now())) {
+      setState(() {
+        widget.session.errorMessage = 'Please choose a future departure time.';
+      });
+      showPremiumAlert(context, 'Please choose a future departure time.', isError: true);
+      return;
+    }
+
     setState(() {
-      if (_originFocusNode.hasFocus) {
-        _destinationSuggestions = const [];
-        _destinationNoResults = false;
-      } else if (_destinationFocusNode.hasFocus) {
-        _originSuggestions = const [];
-        _originNoResults = false;
-      }
+      widget.session.errorMessage = null;
+      widget.session.isLeaveNow = false;
+      widget.session.selectedDepartureDateTime = combined;
+      print('SELECTED_DEPARTURE_DATETIME: ${_formatISO8601(combined)}');
     });
   }
 
@@ -1213,10 +1617,18 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
     widget.session.selectedOrigin = origin;
     widget.session.selectedDestination = destination;
 
+    if (widget.session.isLeaveNow) {
+      widget.session.selectedDepartureDateTime = DateTime.now();
+    }
+
+    final dt = widget.session.selectedDepartureDateTime ?? DateTime.now();
+    final departureTimeStr = _formatISO8601(dt);
+    print('PLAN_TRIP_REQUEST_WITH_DEPARTURE_TIME: $departureTimeStr');
+
     return widget.services.calculateRouteFromCoordinates(
       origin: origin,
       destination: destination,
-      departureTime: widget.session.selectedDepartureTime,
+      departureTime: departureTimeStr,
     );
   }
 
@@ -1245,32 +1657,6 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
       setState(() {
         widget.session.errorMessage = _friendlySearchError(error);
         widget.session.loadingRoutes = false;
-      });
-    }
-  }
-
-  Future<void> _pickTime() async {
-    final TimeOfDay? picked = await showTimePicker(
-      context: context,
-      initialTime: TimeOfDay.now(),
-      builder: (context, child) {
-        return Theme(
-          data: ThemeData.light().copyWith(
-            colorScheme: const ColorScheme.light(
-              primary: green,
-              onPrimary: Colors.white,
-              onSurface: ink,
-            ),
-          ),
-          child: child!,
-        );
-      },
-    );
-    if (picked != null) {
-      setState(() {
-        final hh = picked.hour.toString().padLeft(2, '0');
-        final mm = picked.minute.toString().padLeft(2, '0');
-        widget.session.selectedDepartureTime = '$hh:$mm:00';
       });
     }
   }
@@ -1346,6 +1732,50 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
   }
 
   Future<void> _runRecentSearch(RecentTripSearch recent) async {
+    _originDebounce?.cancel();
+    _destinationDebounce?.cancel();
+    _suppressSuggestionLookup = true;
+    _originController.text = recent.originText;
+    _destinationController.text = recent.destinationText;
+    _originController.selection =
+        TextSelection.collapsed(offset: recent.originText.length);
+    _destinationController.selection =
+        TextSelection.collapsed(offset: recent.destinationText.length);
+    _suppressSuggestionLookup = false;
+
+    setState(() {
+      widget.session.originText = recent.originText;
+      widget.session.destinationText = recent.destinationText;
+      widget.session.selectedOrigin = Map<String, double>.from(recent.origin);
+      widget.session.selectedDestination =
+          Map<String, double>.from(recent.destination);
+      widget.session.errorMessage = null;
+      widget.session.loadingRoutes = true;
+      widget.session.lastSearchRequest = recent.label;
+      _originSuggestions = const [];
+      _destinationSuggestions = const [];
+      _originNoResults = false;
+      _destinationNoResults = false;
+    });
+
+    try {
+      final response = await _searchRoutes();
+      if (!mounted) return;
+      setState(() {
+        widget.session.routeResponse = response;
+        widget.session.loadingRoutes = false;
+        _saveRecentSearch();
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        widget.session.errorMessage = _friendlySearchError(error);
+        widget.session.loadingRoutes = false;
+      });
+    }
+  }
+
+  Future<void> _runFavoriteSearch(FavoriteTrip recent) async {
     _originDebounce?.cancel();
     _destinationDebounce?.cancel();
     _suppressSuggestionLookup = true;
@@ -1638,6 +2068,67 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
     return double.parse(value.toString());
   }
 
+  bool _isCurrentQueryFavorite() {
+    final originText = _originController.text.trim();
+    final destText = _destinationController.text.trim();
+    if (originText.isEmpty || destText.isEmpty) return false;
+    return widget.session.favoriteSearches.any((fav) =>
+        fav.originText.toLowerCase() == originText.toLowerCase() &&
+        fav.destinationText.toLowerCase() == destText.toLowerCase());
+  }
+
+  void _toggleFavorite() async {
+    final originText = _originController.text.trim();
+    final destText = _destinationController.text.trim();
+    final origin = widget.session.selectedOrigin;
+    final destination = widget.session.selectedDestination;
+    if (originText.isEmpty || destText.isEmpty || origin == null || destination == null) return;
+    
+    final exists = widget.session.favoriteSearches.any((fav) =>
+        fav.originText.toLowerCase() == originText.toLowerCase() &&
+        fav.destinationText.toLowerCase() == destText.toLowerCase());
+        
+    if (exists) {
+      final favItem = widget.session.favoriteSearches.firstWhere((fav) =>
+          fav.originText.toLowerCase() == originText.toLowerCase() &&
+          fav.destinationText.toLowerCase() == destText.toLowerCase());
+      try {
+        await widget.services.deleteFavorite(favItem.routeId);
+        setState(() {
+          widget.session.favoriteSearches.removeWhere((fav) => fav.routeId == favItem.routeId);
+        });
+      } catch (e) {
+        debugPrint('Error deleting favorite: $e');
+      }
+    } else {
+      final generatedRouteId = 'trip_plan_${DateTime.now().millisecondsSinceEpoch}';
+      try {
+        final res = await widget.services.addFavorite(
+          routeId: generatedRouteId,
+          routeName: '$originText -> $destText',
+          originLat: origin['lat']!,
+          originLon: origin['lon']!,
+          destinationLat: destination['lat']!,
+          destinationLon: destination['lon']!,
+          originName: originText,
+          destinationName: destText,
+        );
+        final returnedRouteId = res['route_id'] ?? generatedRouteId;
+        setState(() {
+          widget.session.favoriteSearches.add(FavoriteTrip(
+            routeId: returnedRouteId,
+            originText: originText,
+            destinationText: destText,
+            origin: Map<String, double>.from(origin),
+            destination: Map<String, double>.from(destination),
+          ));
+        });
+      } catch (e) {
+        debugPrint('Error adding favorite: $e');
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final focusedContext = FocusManager.instance.primaryFocus?.context;
@@ -1651,9 +2142,23 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
     final searchFocused =
         _originFocusNode.hasFocus || _destinationFocusNode.hasFocus;
     final searchOnlyMode = keyboardVisible && searchFocused;
+
+    final hasLocations = widget.session.selectedOrigin != null &&
+        widget.session.selectedDestination != null;
+    final isFavorite = hasLocations && _isCurrentQueryFavorite();
+
     final header = GreenHeader(
       title: 'Plan Your Trip',
       onBack: () => widget.onGo(AppScreen.home),
+      trailing: hasLocations
+          ? IconButton(
+              icon: Icon(
+                isFavorite ? Icons.star : Icons.star_border,
+                color: isFavorite ? Colors.amber : Colors.white,
+              ),
+              onPressed: _toggleFavorite,
+            )
+          : null,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
@@ -1714,12 +2219,19 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
             children: [
               Expanded(
                 child: _ModeChip(
-                  icon: Icons.schedule, 
-                  label: 'Leave now',
-                  selected: widget.session.selectedDepartureTime == 'now',
+                  icon: Icons.schedule,
+                  label: widget.session.isLeaveNow
+                      ? _formatDisplayDateTime(
+                          widget.session.selectedDepartureDateTime,
+                          fallback: 'Leaving now')
+                      : 'Leave now',
+                  selected: widget.session.isLeaveNow,
                   onTap: () {
                     setState(() {
-                      widget.session.selectedDepartureTime = 'now';
+                      widget.session.isLeaveNow = true;
+                      widget.session.selectedDepartureDateTime = DateTime.now();
+                      print('LEAVE_NOW_CLICKED');
+                      print('SELECTED_DEPARTURE_DATETIME: ${_formatISO8601(widget.session.selectedDepartureDateTime!)}');
                     });
                   },
                 ),
@@ -1727,10 +2239,12 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
               const SizedBox(width: 8),
               Expanded(
                 child: _ModeChip(
-                  icon: Icons.calendar_month, 
-                  label: widget.session.selectedDepartureTime == 'now' ? 'Schedule' : widget.session.selectedDepartureTime.substring(0, 5),
-                  selected: widget.session.selectedDepartureTime != 'now',
-                  onTap: _pickTime,
+                  icon: Icons.calendar_month,
+                  label: widget.session.isLeaveNow
+                      ? 'Schedule'
+                      : _formatDisplayDateTime(widget.session.selectedDepartureDateTime),
+                  selected: !widget.session.isLeaveNow,
+                  onTap: _handleScheduleTap,
                 ),
               ),
               const SizedBox(width: 8),
@@ -1799,6 +2313,36 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
                     ],
                     const SizedBox(height: 24),
                     const EmptyRouteState(),
+                    if (widget.session.favoriteSearches.isNotEmpty) ...[
+                      const SizedBox(height: 32),
+                      const Text(
+                        'Favorite Trips',
+                        style: TextStyle(
+                            color: muted, fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 12),
+                      ...widget.session.favoriteSearches.map(
+                        (item) => FavoriteSearch(
+                          text: item.label,
+                          onTap: () => _runFavoriteSearch(item),
+                        ),
+                      ),
+                    ],
+                    if (widget.session.recentSearches.isNotEmpty) ...[
+                      const SizedBox(height: 32),
+                      const Text(
+                        'Recent Searches',
+                        style: TextStyle(
+                            color: muted, fontWeight: FontWeight.w800),
+                      ),
+                      const SizedBox(height: 12),
+                      ...widget.session.recentSearches.map(
+                        (item) => RecentSearch(
+                          text: item.label,
+                          onTap: () => _runRecentSearch(item),
+                        ),
+                      ),
+                    ],
                   ],
                 )
               : Builder(
@@ -1869,6 +2413,21 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
                                 }
                               },
                             ),
+                          if (widget.session.favoriteSearches.isNotEmpty) ...[
+                            const SizedBox(height: 22),
+                            const Text(
+                              'Favorite Trips',
+                              style: TextStyle(
+                                  color: muted, fontWeight: FontWeight.w800),
+                            ),
+                            const SizedBox(height: 12),
+                            ...widget.session.favoriteSearches.map(
+                              (item) => FavoriteSearch(
+                                text: item.label,
+                                onTap: () => _runFavoriteSearch(item),
+                              ),
+                            ),
+                          ],
                           const SizedBox(height: 22),
                           const Text(
                             'Recent Searches',
@@ -2078,7 +2637,12 @@ class _PlanTripScreenState extends State<PlanTripScreen> {
 }
 
 class _ModeChip extends StatelessWidget {
-  const _ModeChip({required this.icon, required this.label, this.selected = false, this.onTap});
+  const _ModeChip({
+    required this.icon,
+    required this.label,
+    this.selected = false,
+    this.onTap,
+  });
 
   final IconData icon;
   final String label;
@@ -2087,30 +2651,35 @@ class _ModeChip extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      onTap: onTap,
+    return Material(
+      color: selected ? Colors.white : Colors.white.withValues(alpha: .2),
       borderRadius: BorderRadius.circular(9),
-      child: Container(
-        height: 44,
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        decoration: BoxDecoration(
-            color: selected ? Colors.white : Colors.white.withValues(alpha: .2),
-            borderRadius: BorderRadius.circular(9)),
-        child: Row(
-          mainAxisAlignment: MainAxisAlignment.center,
-          children: [
-            Icon(icon, color: selected ? green : Colors.white, size: 16),
-            const SizedBox(width: 6),
-            Flexible(
-              child: FittedBox(
-                fit: BoxFit.scaleDown,
-                child: Text(label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(9),
+        child: Container(
+          height: 44,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, color: selected ? green : Colors.white, size: 16),
+              const SizedBox(width: 6),
+              Flexible(
+                child: FittedBox(
+                  fit: BoxFit.scaleDown,
+                  child: Text(
+                    label,
                     maxLines: 1,
                     style: TextStyle(
-                        color: selected ? green : Colors.white, fontWeight: FontWeight.w800)),
+                      color: selected ? green : Colors.white,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
@@ -2194,12 +2763,14 @@ class RouteDetailsScreen extends StatefulWidget {
     required this.connect,
     required this.onGo,
     required this.route,
+    this.onNavigationUpdate,
   });
 
   final AppServices services;
   final BackendConnector connect;
   final ValueChanged<AppScreen> onGo;
   final Map<String, dynamic>? route;
+  final void Function(String routeId, String? vehicleId)? onNavigationUpdate;
 
   @override
   State<RouteDetailsScreen> createState() => _RouteDetailsScreenState();
@@ -2212,6 +2783,12 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
   bool _navigationStarted = false;
   String? _trackingMessage;
   Map<String, dynamic>? _enrichedRoute;
+
+  final MapController _mapController = MapController();
+  StreamSubscription<Position>? _positionSubscription;
+  LatLng? _userLocation;
+  double? _userHeading;
+  bool _followUser = false;
 
   /// Use enriched route data when available, falling back to widget.route.
   Map<String, dynamic>? get _effectiveRoute => _enrichedRoute ?? widget.route;
@@ -2233,8 +2810,51 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
   @override
   void dispose() {
     _trackingTimer?.cancel();
+    _positionSubscription?.cancel();
     debugPrint('PASSENGER_POLL_TIMER_STOPPED');
     super.dispose();
+  }
+
+  Future<void> _initLocationTracking() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return;
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        return;
+      }
+      
+      final initialPos = await Geolocator.getCurrentPosition(
+        desiredAccuracy: LocationAccuracy.high,
+      );
+      if (mounted) {
+        setState(() {
+          _userLocation = LatLng(initialPos.latitude, initialPos.longitude);
+          _userHeading = initialPos.heading;
+        });
+      }
+
+      _positionSubscription = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 3,
+        ),
+      ).listen((Position position) {
+        if (!mounted) return;
+        setState(() {
+          _userLocation = LatLng(position.latitude, position.longitude);
+          _userHeading = position.heading;
+        });
+        if (_followUser) {
+          _mapController.move(_userLocation!, _mapController.camera.zoom);
+        }
+      });
+    } catch (e) {
+      debugPrint('Error starting details location tracking: $e');
+    }
   }
 
   void _startTracking() {
@@ -2253,6 +2873,7 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
       const Duration(seconds: 10),
       (_) => _pollVehicles(quiet: true),
     );
+    _initLocationTracking();
   }
 
   Future<void> _fetchRouteDetails() async {
@@ -2262,12 +2883,12 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
       debugPrint('PASSENGER_FETCH_ROUTE_DETAILS: $routeId');
       final data = await widget.services.loadRouteDetails(routeId);
       if (!mounted) return;
-      // The backend returns {route_id, route_name, label, total_travel_time, total_fare, legs}
-      // which is exactly what the map and stops timeline need.
       final legs = data['legs'];
       if (legs is List && legs.isNotEmpty) {
         setState(() {
-          _enrichedRoute = data;
+          _enrichedRoute = widget.route == null
+              ? data
+              : mergeSelectedRouteWithDetails(widget.route!, data);
         });
         debugPrint('PASSENGER_ROUTE_DETAILS_ENRICHED: ${legs.length} legs');
       }
@@ -2343,6 +2964,11 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
           _trackingMessage = null;
         }
       });
+
+      if (_navigationStarted) {
+        final vehicleId = nextVehicles.isNotEmpty ? nextVehicles.keys.first : null;
+        widget.onNavigationUpdate?.call(routeId, vehicleId);
+      }
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -2350,6 +2976,10 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
         _trackingLoading = false;
         _trackingMessage = 'No active vehicle currently available for this route.';
       });
+
+      if (_navigationStarted) {
+        widget.onNavigationUpdate?.call(routeId, null);
+      }
     }
   }
 
@@ -2403,16 +3033,43 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
       return;
     }
 
+    setState(() {
+      _navigationStarted = true;
+      _followUser = true;
+    });
+    if (_userLocation != null) {
+      _mapController.move(_userLocation!, 15.0);
+    }
+    final selectedRoute = _effectiveRoute;
+    if (selectedRoute == null) return;
+
+    // Open navigation immediately. Backend activation continues quietly so it
+    // never blocks the transition or shows a "navigation started" popup.
+    final navigationResult = Navigator.push<bool>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => NavigationScreen(selectedRoute: selectedRoute),
+      ),
+    );
+    unawaited(_activateNavigation(routeId));
+
+    final destinationReached = await navigationResult;
+    if (!mounted) return;
+    setState(() => _navigationStarted = false);
+    if (destinationReached == true) {
+      widget.onNavigationUpdate?.call(routeId, null);
+      showPremiumAlert(context, 'Destination reached!');
+    }
+  }
+
+  Future<void> _activateNavigation(String routeId) async {
     final connected = await widget.connect(
       'Start navigation',
       () => widget.services.startTrip(routeId),
+      quiet: true,
     );
     if (!mounted || !connected) return;
-
-    setState(() {
-      _navigationStarted = true;
-    });
-    await _pollVehicles();
+    await _pollVehicles(quiet: true);
   }
 
   String _relativeTime(String raw) {
@@ -2563,6 +3220,16 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
                 child: RouteMapPreview(
                   route: route,
                   liveVehicles: _vehiclesById.values.toList(),
+                  userLocation: _userLocation,
+                  userHeading: _userHeading,
+                  mapController: _mapController,
+                  onPositionChanged: (position, hasGesture) {
+                    if (hasGesture) {
+                      setState(() {
+                        _followUser = false;
+                      });
+                    }
+                  },
                 ),
               ),
               const SizedBox(height: 12),
@@ -2742,7 +3409,7 @@ class _RouteDetailsScreenState extends State<RouteDetailsScreen> {
   }
 }
 
-class WalletScreen extends StatelessWidget {
+class WalletScreen extends StatefulWidget {
   const WalletScreen({
     super.key,
     required this.services,
@@ -2759,61 +3426,147 @@ class WalletScreen extends StatelessWidget {
   final Future<void> Function() onToggleTicket;
 
   @override
+  State<WalletScreen> createState() => _WalletScreenState();
+}
+
+class _WalletScreenState extends State<WalletScreen> {
+  Map<String, dynamic>? _walletData;
+  bool _loading = true;
+  String? _errorMessage;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchWalletData(quiet: true);
+  }
+
+  Future<void> _fetchWalletData({bool quiet = false}) async {
+    if (!quiet) {
+      setState(() {
+        _loading = true;
+        _errorMessage = null;
+      });
+    }
+    try {
+      final data = await widget.services.loadWallet();
+      if (!mounted) return;
+      setState(() {
+        _walletData = data;
+        _loading = false;
+        _errorMessage = null;
+      });
+    } catch (e) {
+      print('WALLET_FETCH_ERROR: $e');
+      if (!mounted) return;
+      setState(() {
+        _loading = false;
+        _errorMessage = e.toString().replaceFirst('Exception: ', '');
+      });
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
+    if (_loading && _walletData == null) {
+      return Scaffold(
+        body: Column(
+          children: [
+            Container(
+              color: green,
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+              child: SafeArea(
+                bottom: false,
+                child: HeaderRow(
+                    title: 'My Wallet', onBack: () => widget.onGo(AppScreen.home)),
+              ),
+            ),
+            const Expanded(
+              child: Center(child: CircularProgressIndicator()),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final balance = _walletData?['balance']?.toString() ?? '0.0';
+    final currency = _walletData?['currency']?.toString() ?? 'EGP';
+    final paymentMethods = _walletData?['payment_methods'] as List? ?? const [];
+    final transactions = _walletData?['transactions'] as List? ?? const [];
+
     return Column(
       children: [
-        BackendLoader(
-          action: 'Wallet',
-          connect: connect,
-          request: services.loadWallet,
-        ),
         Container(
           color: green,
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 90),
           child: SafeArea(
             bottom: false,
             child: HeaderRow(
-                title: 'My Wallet', onBack: () => onGo(AppScreen.home)),
+                title: 'My Wallet', onBack: () => widget.onGo(AppScreen.home)),
           ),
         ),
         Expanded(
           child: Transform.translate(
             offset: const Offset(0, -56),
-            child: ListView(
-              padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
-              children: [
-                WalletBalance(
-                  services: services,
-                  connect: connect,
-                  onToggleTicket: onToggleTicket,
-                ),
-                const SizedBox(height: 16),
-                Row(
-                  children: const [
-                    Expanded(
+            child: RefreshIndicator(
+              onRefresh: () => _fetchWalletData(quiet: true),
+              color: green,
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(18, 0, 18, 18),
+                children: [
+                  if (_errorMessage != null)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: 12),
+                      child: Text(
+                        _errorMessage!,
+                        style: const TextStyle(color: rose, fontSize: 13),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                  WalletBalance(
+                    services: widget.services,
+                    connect: widget.connect,
+                    balance: '$balance $currency',
+                    onToggleTicket: widget.onToggleTicket,
+                    onTopUpSuccess: () => _fetchWalletData(quiet: true),
+                  ),
+                  const SizedBox(height: 16),
+                  Row(
+                    children: [
+                      Expanded(
                         child: StatCard(
-                            icon: Icons.trending_up,
-                            title: 'This Month',
-                            value: '45 EGP',
-                            note: '3 trips')),
-                    SizedBox(width: 12),
-                    Expanded(
+                          icon: Icons.trending_up,
+                          title: 'This Month',
+                          value: '${transactions.where((tx) => tx['type'] == 'debit').fold<double>(0.0, (sum, tx) => sum + (tx['amount'] as num).toDouble()).toStringAsFixed(0)} EGP',
+                          note: '${transactions.where((tx) => tx['type'] == 'debit').length} trips',
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
                         child: StatCard(
-                            icon: Icons.schedule,
-                            title: 'Avg. Trip',
-                            value: '15 EGP',
-                            note: 'per ride')),
-                  ],
-                ),
-                const SizedBox(height: 22),
-                if (showTicket)
-                  DigitalTicket(
-                      services: services,
-                      connect: connect,
-                      onClose: onToggleTicket)
-                else
-                  WalletTransactions(services: services, connect: connect),
-              ],
+                          icon: Icons.schedule,
+                          title: 'Total Charges',
+                          value: '${transactions.where((tx) => tx['type'] == 'top_up').fold<double>(0.0, (sum, tx) => sum + (tx['amount'] as num).toDouble()).toStringAsFixed(0)} EGP',
+                          note: 'wallet balance',
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 22),
+                  if (widget.showTicket)
+                    DigitalTicket(
+                        services: widget.services,
+                        connect: widget.connect,
+                        onClose: widget.onToggleTicket)
+                  else
+                    WalletTransactions(
+                      services: widget.services,
+                      connect: widget.connect,
+                      paymentMethods: paymentMethods,
+                      transactions: transactions,
+                      onAddPaymentMethodSuccess: () => _fetchWalletData(quiet: true),
+                    ),
+                ],
+              ),
             ),
           ),
         ),
@@ -2822,27 +3575,108 @@ class WalletScreen extends StatelessWidget {
   }
 }
 
-class NotificationsScreen extends StatelessWidget {
+class NotificationsScreen extends StatefulWidget {
   const NotificationsScreen({
     super.key,
     required this.services,
     required this.connect,
     required this.onGo,
+    this.onNotificationsChanged,
   });
 
   final AppServices services;
   final BackendConnector connect;
   final ValueChanged<AppScreen> onGo;
+  final VoidCallback? onNotificationsChanged;
+
+  @override
+  State<NotificationsScreen> createState() => _NotificationsScreenState();
+}
+
+class _NotificationsScreenState extends State<NotificationsScreen> {
+  List<dynamic> _dynamicNotifications = [];
+  bool _isLoading = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchNotifications();
+  }
+
+  Future<void> _fetchNotifications() async {
+    setState(() {
+      _isLoading = true;
+    });
+    try {
+      final res = await widget.services.loadNotifications();
+      if (!mounted) return;
+      setState(() {
+        _dynamicNotifications = res['notifications'] ?? [];
+        _isLoading = false;
+      });
+      widget.onNotificationsChanged?.call();
+    } catch (e) {
+      debugPrint('Error fetching notifications: $e');
+      if (!mounted) return;
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  Future<void> _markAllRead() async {
+    final connected = await widget.connect(
+      'Mark all notifications as read',
+      () => widget.services.markNotificationsRead(),
+      quiet: true,
+    );
+    if (connected) {
+      _fetchNotifications();
+    }
+  }
+
+  Future<void> _markSingleRead(String notificationId) async {
+    final connected = await widget.connect(
+      'Mark notification as read',
+      () => widget.services.markSingleNotificationRead(notificationId),
+      quiet: true,
+    );
+    if (connected) {
+      _fetchNotifications();
+    }
+  }
+
+  Color _parseColor(String? hex, Color defaultColor) {
+    if (hex == null || hex.isEmpty) return defaultColor;
+    final cleanHex = hex.replaceFirst('#', '');
+    if (cleanHex.length == 6) {
+      return Color(int.parse('FF$cleanHex', radix: 16));
+    } else if (cleanHex.length == 8) {
+      return Color(int.parse(cleanHex, radix: 16));
+    }
+    return defaultColor;
+  }
+
+  IconData _parseIcon(String name) {
+    switch (name) {
+      case 'check_circle_outline':
+        return Icons.check_circle_outline;
+      case 'error_outline':
+        return Icons.error_outline;
+      case 'schedule':
+        return Icons.schedule;
+      case 'info_outline':
+      default:
+        return Icons.info_outline;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
+    final unreadCount = _dynamicNotifications.where((n) => n['unread'] == true).length;
+
     return Column(
       children: [
-        BackendLoader(
-          action: 'Notifications',
-          connect: connect,
-          request: services.loadNotifications,
-        ),
         Container(
           color: green,
           padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
@@ -2851,7 +3685,7 @@ class NotificationsScreen extends StatelessWidget {
             child: Row(
               children: [
                 IconButton(
-                    onPressed: () => onGo(AppScreen.home),
+                    onPressed: () => widget.onGo(AppScreen.home),
                     icon: const Icon(Icons.arrow_back, color: Colors.white)),
                 const Text('Notifications',
                     style: TextStyle(
@@ -2859,16 +3693,19 @@ class NotificationsScreen extends StatelessWidget {
                         fontWeight: FontWeight.w900,
                         fontSize: 18)),
                 const Spacer(),
-                Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
-                  decoration: BoxDecoration(
-                      color: Colors.white,
-                      borderRadius: BorderRadius.circular(999)),
-                  child: const Text('2 new',
-                      style:
-                          TextStyle(color: green, fontWeight: FontWeight.w700)),
-                ),
+                if (unreadCount > 0)
+                  GestureDetector(
+                    onTap: _markAllRead,
+                    child: Container(
+                      padding:
+                          const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+                      decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(999)),
+                      child: Text('$unreadCount new',
+                          style: const TextStyle(color: green, fontWeight: FontWeight.w700)),
+                    ),
+                  ),
               ],
             ),
           ),
@@ -2886,57 +3723,177 @@ class NotificationsScreen extends StatelessWidget {
           ),
         ),
         Expanded(
+          child: RefreshIndicator(
+            onRefresh: _fetchNotifications,
+            child: ListView(
+              padding: EdgeInsets.zero,
+              children: [
+                if (_isLoading && _dynamicNotifications.isEmpty)
+                  const Padding(
+                    padding: EdgeInsets.all(20.0),
+                    child: Center(child: CircularProgressIndicator(color: green)),
+                  ),
+                ..._dynamicNotifications.map((notif) {
+                  final hexBg = notif['bg']?.toString();
+                  final hexColor = notif['color']?.toString();
+                  return NoticeTile(
+                    key: ValueKey('notif-${notif['id']}'),
+                    icon: _parseIcon(notif['icon']?.toString() ?? ''),
+                    bg: _parseColor(hexBg, const Color(0xFFEFF6FF)),
+                    color: _parseColor(hexColor, const Color(0xFF2563EB)),
+                    title: notif['title']?.toString() ?? 'Notification',
+                    body: notif['body']?.toString() ?? '',
+                    time: notif['time']?.toString() ?? 'Just now',
+                    unread: notif['unread'] == true,
+                    onTapMarkRead: () => _markSingleRead(notif['id']?.toString() ?? ''),
+                  );
+                }),
+                NoticeTile(
+                    icon: Icons.error_outline,
+                    bg: const Color(0xFFFFF7DC),
+                    color: const Color(0xFFF59E0B),
+                    title: 'Route Delay',
+                    body:
+                        'Bus B101 is delayed by 5 minutes due to heavy traffic on Salah Salem',
+                    time: '5 min ago',
+                    unread: false),
+                NoticeTile(
+                    icon: Icons.info_outline,
+                    bg: const Color(0xFFEFF6FF),
+                    color: const Color(0xFF2563EB),
+                    title: 'New Route Available',
+                    body:
+                        'Direct route from Heliopolis to New Cairo now available',
+                    time: '1 hour ago',
+                    unread: false),
+                NoticeTile(
+                    icon: Icons.check_circle_outline,
+                    bg: paleGreen,
+                    color: green,
+                    title: 'Payment Successful',
+                    body: 'Your wallet has been topped up with 100 EGP',
+                    time: '2 hours ago'),
+                NoticeTile(
+                    icon: Icons.error_outline,
+                    bg: const Color(0xFFFFEBEE),
+                    color: rose,
+                    title: 'Service Interruption',
+                    body:
+                        'Route M45 temporarily unavailable due to road maintenance',
+                    time: 'Yesterday'),
+                NoticeTile(
+                    icon: Icons.schedule,
+                    bg: const Color(0xFFEFF6FF),
+                    color: const Color(0xFF2563EB),
+                    title: 'Schedule Update',
+                    body:
+                        'Weekend schedules updated for all routes in Maadi area',
+                    time: '2 days ago'),
+                NoticeTile(
+                    icon: Icons.check_circle_outline,
+                    bg: paleGreen,
+                    color: green,
+                    title: 'Trip Completed',
+                    body: "You've earned 10 loyalty points for your last trip",
+                    time: '3 days ago'),
+              ],
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class PassengerSettingsScreen extends StatelessWidget {
+  const PassengerSettingsScreen({
+    super.key,
+    required this.notificationsEnabled,
+    required this.liveVehicleUpdatesEnabled,
+    required this.onNotificationsChanged,
+    required this.onLiveVehicleUpdatesChanged,
+    required this.onClearRecentSearches,
+    required this.onBack,
+  });
+
+  final bool notificationsEnabled;
+  final bool liveVehicleUpdatesEnabled;
+  final ValueChanged<bool> onNotificationsChanged;
+  final ValueChanged<bool> onLiveVehicleUpdatesChanged;
+  final VoidCallback onClearRecentSearches;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          color: green,
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+          child: SafeArea(
+            bottom: false,
+            child: HeaderRow(title: 'Settings', onBack: onBack),
+          ),
+        ),
+        Expanded(
           child: ListView(
-            padding: EdgeInsets.zero,
-            children: const [
-              NoticeTile(
-                  icon: Icons.error_outline,
-                  bg: Color(0xFFFFF7DC),
-                  color: Color(0xFFF59E0B),
-                  title: 'Route Delay',
-                  body:
-                      'Bus B101 is delayed by 5 minutes due to heavy traffic on Salah Salem',
-                  time: '5 min ago',
-                  unread: true),
-              NoticeTile(
-                  icon: Icons.info_outline,
-                  bg: Color(0xFFEFF6FF),
-                  color: Color(0xFF2563EB),
-                  title: 'New Route Available',
-                  body:
-                      'Direct route from Heliopolis to New Cairo now available',
-                  time: '1 hour ago',
-                  unread: true),
-              NoticeTile(
-                  icon: Icons.check_circle_outline,
-                  bg: paleGreen,
-                  color: green,
-                  title: 'Payment Successful',
-                  body: 'Your wallet has been topped up with 100 EGP',
-                  time: '2 hours ago'),
-              NoticeTile(
-                  icon: Icons.error_outline,
-                  bg: Color(0xFFFFEBEE),
-                  color: rose,
-                  title: 'Service Interruption',
-                  body:
-                      'Route M45 temporarily unavailable due to road maintenance',
-                  time: 'Yesterday'),
-              NoticeTile(
-                  icon: Icons.schedule,
-                  bg: Color(0xFFEFF6FF),
-                  color: Color(0xFF2563EB),
-                  title: 'Schedule Update',
-                  body:
-                      'Weekend schedules updated for all routes in Maadi area',
-                  time: '2 days ago'),
-              NoticeTile(
-                  icon: Icons.check_circle_outline,
-                  bg: paleGreen,
-                  color: green,
-                  title: 'Trip Completed',
-                  body: "You've earned 10 loyalty points for your last trip",
-                  time: '3 days ago'),
+            padding: const EdgeInsets.all(18),
+            children: [
+              CardShell(
+                padding: EdgeInsets.zero,
+                child: Column(
+                  children: [
+                    SwitchListTile(
+                      value: notificationsEnabled,
+                      activeColor: green,
+                      title: const Text('Service notifications',
+                          style: TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: const Text(
+                          'Receive disruption and service alerts'),
+                      secondary:
+                          const Icon(Icons.notifications_outlined, color: green),
+                      onChanged: onNotificationsChanged,
+                    ),
+                    const Divider(height: 1),
+                    SwitchListTile(
+                      value: liveVehicleUpdatesEnabled,
+                      activeColor: green,
+                      title: const Text('Live vehicle updates',
+                          style: TextStyle(fontWeight: FontWeight.w800)),
+                      subtitle: const Text(
+                          'Refresh nearby active buses every 10 seconds'),
+                      secondary:
+                          const Icon(Icons.directions_bus_outlined, color: green),
+                      onChanged: onLiveVehicleUpdatesChanged,
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              SettingsTile(
+                icon: Icons.location_on_outlined,
+                title: 'Location permissions',
+                trailing: 'Open',
+                onTap: () async {
+                  final opened = await Geolocator.openAppSettings();
+                  if (!opened && context.mounted) {
+                    showPremiumAlert(
+                      context,
+                      'Unable to open device settings.',
+                      isError: true,
+                    );
+                  }
+                },
+              ),
+              SettingsTile(
+                icon: Icons.history,
+                title: 'Clear recent searches',
+                trailing: 'Clear',
+                onTap: () {
+                  onClearRecentSearches();
+                  showPremiumAlert(context, 'Recent searches cleared.');
+                },
+              ),
             ],
           ),
         ),
@@ -2981,7 +3938,9 @@ class ProfileScreen extends StatelessWidget {
             child: ListView(
               padding: const EdgeInsets.fromLTRB(18, 0, 18, 26),
               children: [
-                ProfileSummaryCard(),
+                ProfileSummaryCard(
+                  onSettings: () => onGo(AppScreen.settings),
+                ),
                 const SizedBox(height: 24),
                 ProfileSection(
                   title: 'ACCOUNT',
@@ -3120,18 +4079,20 @@ class GreenHeader extends StatelessWidget {
       required this.title,
       required this.child,
       required this.onBack,
-      this.scrollable = false});
+      this.scrollable = false,
+      this.trailing});
 
   final String title;
   final Widget child;
   final VoidCallback onBack;
   final bool scrollable;
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
     final content = Column(
       children: [
-        HeaderRow(title: title, onBack: onBack),
+        HeaderRow(title: title, onBack: onBack, trailing: trailing),
         const SizedBox(height: 14),
         if (scrollable) Expanded(child: child) else child,
       ],
@@ -3149,10 +4110,16 @@ class GreenHeader extends StatelessWidget {
 }
 
 class HeaderRow extends StatelessWidget {
-  const HeaderRow({super.key, required this.title, required this.onBack});
+  const HeaderRow({
+    super.key,
+    required this.title,
+    required this.onBack,
+    this.trailing,
+  });
 
   final String title;
   final VoidCallback onBack;
+  final Widget? trailing;
 
   @override
   Widget build(BuildContext context) {
@@ -3167,6 +4134,7 @@ class HeaderRow extends StatelessWidget {
                 fontWeight: FontWeight.w900,
                 fontSize: 18)),
         const Spacer(),
+        if (trailing != null) trailing!,
       ],
     );
   }
@@ -3261,15 +4229,113 @@ class MapCanvas extends StatelessWidget {
   }
 }
 
+class _UserLocationMarker extends StatelessWidget {
+  const _UserLocationMarker({super.key, this.heading});
+  final double? heading;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        // Pulsing outer blue ring
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.blue.withValues(alpha: 0.15),
+          ),
+        ),
+        // White border ring
+        Container(
+          width: 18,
+          height: 18,
+          decoration: const BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black26,
+                blurRadius: 4,
+                offset: Offset(0, 2),
+              ),
+            ],
+          ),
+        ),
+        // Blue center dot
+        Container(
+          width: 12,
+          height: 12,
+          decoration: const BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.blue,
+          ),
+        ),
+        // Directional cone showing heading
+        if (heading != null)
+          Transform.rotate(
+            angle: (heading! * math.pi) / 180,
+            child: CustomPaint(
+              size: const Size(36, 36),
+              painter: _DirectionConePainter(),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _DirectionConePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..shader = RadialGradient(
+        colors: [
+          Colors.blue.withValues(alpha: 0.4),
+          Colors.blue.withValues(alpha: 0.0),
+        ],
+      ).createShader(Rect.fromCircle(
+          center: Offset(size.width / 2, size.height / 2),
+          radius: size.width / 2))
+      ..style = PaintingStyle.fill;
+
+    final path = ui.Path()
+      ..moveTo(size.width / 2, size.height / 2)
+      ..arcTo(
+        Rect.fromCircle(
+            center: Offset(size.width / 2, size.height / 2),
+            radius: size.width / 2),
+        -math.pi / 2 - math.pi / 6, // 30 degrees left of straight up
+        math.pi / 3, // 60 degrees spread
+        false,
+      )
+      ..close();
+
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
 class RouteMapPreview extends StatelessWidget {
   const RouteMapPreview({
     super.key,
     required this.route,
     this.liveVehicles = const [],
+    this.userLocation,
+    this.userHeading,
+    this.mapController,
+    this.onPositionChanged,
   });
 
   final Map<String, dynamic>? route;
   final List<Map<String, dynamic>> liveVehicles;
+  final LatLng? userLocation;
+  final double? userHeading;
+  final MapController? mapController;
+  final void Function(MapPosition, bool)? onPositionChanged;
 
   double? _asDouble(Object? value) {
     if (value is num) return value.toDouble();
@@ -3311,6 +4377,402 @@ class RouteMapPreview extends StatelessWidget {
         );
       }
     }
+    debugPrint('PASSENGER_MARKERS_AFTER: ${vehicleMarkers.length}');
+
+    if (points.length < 2) {
+      final center = userLocation ?? (vehicleMarkers.isNotEmpty
+          ? vehicleMarkers.first.point
+          : const LatLng(30.0444, 31.2357));
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: FlutterMap(
+          mapController: mapController,
+          options: MapOptions(
+            initialCenter: center,
+            initialZoom: 12,
+            interactionOptions: const InteractionOptions(
+              flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag,
+            ),
+            onPositionChanged: onPositionChanged,
+          ),
+          children: [
+            TileLayer(
+              urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+              userAgentPackageName: 'com.izee.ui',
+            ),
+            MarkerLayer(
+              markers: [
+                if (userLocation != null)
+                  Marker(
+                    point: userLocation!,
+                    width: 48,
+                    height: 48,
+                    child: _UserLocationMarker(heading: userHeading),
+                  ),
+                ...vehicleMarkers,
+              ],
+            ),
+          ],
+        ),
+      );
+    }
+
+    final transferMarkers = _transferMarkers(segments);
+    final bounds = LatLngBounds.fromPoints(points);
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: FlutterMap(
+        mapController: mapController,
+        options: MapOptions(
+          initialCenter: bounds.center,
+          initialZoom: 12,
+          interactionOptions: const InteractionOptions(
+            flags: InteractiveFlag.pinchZoom | InteractiveFlag.drag,
+          ),
+          onPositionChanged: onPositionChanged,
+        ),
+        children: [
+          TileLayer(
+            urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            userAgentPackageName: 'com.izee.ui',
+          ),
+          PolylineLayer(
+            polylines: [
+              for (final segment in segments)
+                Polyline(
+                  points: segment.points,
+                  color: colorForMode(segment.mode),
+                  strokeWidth: segment.mode.toLowerCase().contains('walk')
+                      ? 4
+                      : 6,
+                ),
+            ],
+          ),
+          MarkerLayer(
+            markers: [
+              if (userLocation != null)
+                Marker(
+                  point: userLocation!,
+                  width: 48,
+                  height: 48,
+                  child: _UserLocationMarker(heading: userHeading),
+                ),
+              Marker(
+                point: points.first,
+                width: 36,
+                height: 36,
+                child: const _MapPin(
+                    icon: Icons.navigation, bg: green, color: Colors.white),
+              ),
+              Marker(
+                point: points.last,
+                width: 36,
+                height: 36,
+                child: const _MapPin(
+                    icon: Icons.location_on, bg: rose, color: Colors.white),
+              ),
+              for (final transfer in transferMarkers)
+                Marker(
+                  point: transfer.point,
+                  width: 126,
+                  height: 46,
+                  child: _TransferMarker(transfer: transfer),
+                ),
+              ...vehicleMarkers,
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<_MapLegSegment> _geometrySegments(Map<String, dynamic>? route) {
+    final legs = route?['legs'];
+    if (legs is! List) return const [];
+
+    final segments = <_MapLegSegment>[];
+    for (final leg in legs.whereType<Map<String, dynamic>>()) {
+      final points = _legPoints(leg);
+
+      if (points.length < 2) {
+        continue;
+      }
+
+      segments.add(_MapLegSegment(
+        mode: (leg['mode'] ?? '').toString(),
+        label: (leg['route_label'] ?? leg['route_id'] ?? leg['mode'] ?? '')
+            .toString(),
+        points: points,
+      ));
+    }
+    return segments;
+  }
+
+  List<LatLng> _legPoints(Map<String, dynamic> leg) {
+    final geometry = leg['geometry'];
+    final points = <LatLng>[];
+
+    if (geometry is List) {
+      for (final point in geometry) {
+        final parsed = _pointFromGeometry(point);
+        if (parsed != null) points.add(parsed);
+      }
+    }
+
+    if (points.length >= 2) return points;
+
+    final from = _pointFromStop(leg['from_stop']);
+    final to = _pointFromStop(leg['to_stop']);
+    if (from != null && to != null && from != to) {
+      return [from, to];
+    }
+
+    return points;
+  }
+
+  LatLng? _pointFromGeometry(Object? point) {
+    if (point is List && point.length >= 2) {
+      final lat = point[0];
+      final lon = point[1];
+      if (lat is num && lon is num) {
+        return LatLng(lat.toDouble(), lon.toDouble());
+      }
+    }
+    if (point is Map) {
+      final lat = point['lat'] ?? point['latitude'];
+      final lon = point['lon'] ?? point['lng'] ?? point['longitude'];
+      if (lat is num && lon is num) {
+        return LatLng(lat.toDouble(), lon.toDouble());
+      }
+    }
+    return null;
+  }
+
+  LatLng? _pointFromStop(Object? stop) {
+    if (stop is! Map) return null;
+    final lat = stop['lat'] ?? stop['latitude'];
+    final lon = stop['lon'] ?? stop['lng'] ?? stop['longitude'];
+    if (lat is num && lon is num) {
+      return LatLng(lat.toDouble(), lon.toDouble());
+    }
+    return null;
+  }
+
+  List<_TransferPoint> _transferMarkers(List<_MapLegSegment> segments) {
+    final transfers = <_TransferPoint>[];
+
+    for (var index = 0; index < segments.length - 1; index++) {
+      final current = segments[index];
+      final next = segments[index + 1];
+      final currentMode = current.mode.toLowerCase();
+      final nextMode = next.mode.toLowerCase();
+      final hasTransitBefore = segments
+          .take(index + 1)
+          .any((segment) => !segment.mode.toLowerCase().contains('walk'));
+      final hasTransitAfter = segments
+          .skip(index + 1)
+          .any((segment) => !segment.mode.toLowerCase().contains('walk'));
+      final isRealTransfer = currentMode != nextMode ||
+          (!currentMode.contains('walk') && !nextMode.contains('walk'));
+
+      if (!hasTransitBefore || !hasTransitAfter || !isRealTransfer) continue;
+
+      transfers.add(_TransferPoint(
+        point: current.points.last,
+        fromMode: current.mode,
+        toMode: next.mode,
+      ));
+    }
+
+    return transfers;
+  }
+}
+
+class _MapLegSegment {
+  const _MapLegSegment({
+    required this.mode,
+    required this.label,
+    required this.points,
+  });
+
+  final String mode;
+  final String label;
+  final List<LatLng> points;
+}
+
+class _TransferPoint {
+  const _TransferPoint({
+    required this.point,
+    required this.fromMode,
+    required this.toMode,
+  });
+
+  final LatLng point;
+  final String fromMode;
+  final String toMode;
+}
+
+class _TransferMarker extends StatelessWidget {
+  const _TransferMarker({required this.transfer});
+
+  final _TransferPoint transfer;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: green, width: 2),
+          boxShadow: const [
+            BoxShadow(
+              color: Color(0x26000000),
+              blurRadius: 8,
+              offset: Offset(0, 3),
+            ),
+          ],
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                iconForMode(transfer.fromMode),
+                size: 14,
+                color: colorForMode(transfer.fromMode),
+              ),
+              const Padding(
+                padding: EdgeInsets.symmetric(horizontal: 3),
+                child: Icon(Icons.sync_alt, size: 13, color: muted),
+              ),
+              Icon(
+                iconForMode(transfer.toMode),
+                size: 14,
+                color: colorForMode(transfer.toMode),
+              ),
+              const SizedBox(width: 5),
+              const Text(
+                'Transfer',
+                style: TextStyle(
+                  color: ink,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class MapPainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+        Offset.zero & size, Paint()..color = const Color(0xFFEFFBF8));
+    final grid = Paint()
+      ..color = Colors.white.withValues(alpha: .55)
+      ..strokeWidth = 1;
+    for (double x = 0; x < size.width; x += 28) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), grid);
+    }
+    for (double y = 0; y < size.height; y += 28) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), grid);
+    }
+    final road = Paint()
+      ..color = const Color(0xFFDCE5EA).withValues(alpha: .72)
+      ..strokeWidth = 48;
+    canvas.drawLine(Offset(size.width * .52, -20),
+        Offset(size.width * .34, size.height + 80), road);
+    canvas.drawLine(Offset(-40, size.height * .42),
+        Offset(size.width + 50, size.height * .32), road);
+    canvas.drawLine(Offset(0, size.height * .72),
+        Offset(size.width, size.height * .72), road);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class _SearchBox extends StatelessWidget {
+  const _SearchBox({required this.hint, required this.onTap});
+
+  final String hint;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(9),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(9),
+        child: Container(
+          height: 52,
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Row(
+            children: [
+              const Icon(Icons.search, color: muted, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  hint,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: muted,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class BusTile extends StatelessWidget {
+  const BusTile({
+    super.key,
+    required this.route,
+    required this.place,
+    required this.time,
+    required this.distance,
+    required this.seats,
+    required this.onTap,
+  });
+
+  final String route;
+  final String place;
+  final String time;
+  final String distance;
+  final String seats;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return CardShell(
+      onTap: onTap,
+      margin: const EdgeInsets.only(bottom: 8),
+      color: const Color(0xFFF3FCF8),
+      child: Row(
+        children: [
+          _MapPin(icon: Icons.directions_bus, bg: green, color: Colors.white),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(route,
+                    style: const TextStyle(fontWeight: FontWeight.w900)),
+                Text(place, style: const TextStyle(color: muted, fontSize: 12)),
                 const SizedBox(height: 6),
                 Row(
                   children: [
@@ -3682,12 +5144,88 @@ class WalletBalance extends StatelessWidget {
     super.key,
     required this.services,
     required this.connect,
+    required this.balance,
     required this.onToggleTicket,
+    required this.onTopUpSuccess,
   });
 
   final AppServices services;
   final BackendConnector connect;
+  final String balance;
   final Future<void> Function() onToggleTicket;
+  final VoidCallback onTopUpSuccess;
+
+  Future<void> _showTopUpDialog(BuildContext context) async {
+    final controller = TextEditingController(text: '100');
+    final result = await showDialog<double>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Charge Wallet', style: TextStyle(fontWeight: FontWeight.w900)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Enter amount to charge your wallet (EGP):'),
+              const SizedBox(height: 14),
+              TextField(
+                controller: controller,
+                keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                decoration: const InputDecoration(
+                  labelText: 'Amount',
+                  prefixText: 'EGP ',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                alignment: WrapAlignment.center,
+                children: [50, 100, 200, 500].map((amt) {
+                  return OutlinedButton(
+                    onPressed: () {
+                      controller.text = amt.toString();
+                    },
+                    style: OutlinedButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                    child: Text('$amt'),
+                  );
+                }).toList(),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final amt = double.tryParse(controller.text);
+                if (amt != null && amt > 0) {
+                  Navigator.pop(context, amt);
+                } else {
+                  showPremiumAlert(context, 'Please enter a valid positive amount.', isError: true);
+                }
+              },
+              style: FilledButton.styleFrom(backgroundColor: green),
+              child: const Text('Confirm'),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (result == null) return;
+
+    final success = await connect('Wallet charge', () => services.topUpWallet(result));
+    if (success) {
+      onTopUpSuccess();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3702,16 +5240,16 @@ class WalletBalance extends StatelessWidget {
         children: [
           Row(
             children: [
-              const Expanded(
+              Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text('Available Balance',
+                    const Text('Available Balance',
                         style: TextStyle(
                             color: Colors.white, fontWeight: FontWeight.w700)),
-                    SizedBox(height: 6),
-                    Text('250 EGP',
-                        style: TextStyle(
+                    const SizedBox(height: 6),
+                    Text(balance,
+                        style: const TextStyle(
                             color: Colors.white,
                             fontSize: 34,
                             fontWeight: FontWeight.w900)),
@@ -3728,29 +5266,34 @@ class WalletBalance extends StatelessWidget {
           Row(
             children: [
               Expanded(
-                child: FilledButton.icon(
-                  onPressed: () =>
-                      connect('Wallet top-up', services.topUpWallet),
+                child: FilledButton(
+                  onPressed: () => _showTopUpDialog(context),
                   style: FilledButton.styleFrom(
                       backgroundColor: Colors.white,
                       foregroundColor: green,
+                      alignment: Alignment.center,
                       padding: const EdgeInsets.all(14)),
-                  icon: const Icon(Icons.add),
-                  label: const Text('Top Up',
-                      style: TextStyle(fontWeight: FontWeight.w900)),
+                  child: const Center(
+                    child: Text('Charge',
+                        style: TextStyle(fontWeight: FontWeight.w900),
+                        textAlign: TextAlign.center),
+                  ),
                 ),
               ),
               const SizedBox(width: 12),
               Expanded(
-                child: FilledButton.icon(
+                child: FilledButton(
                   onPressed: () => onToggleTicket(),
                   style: FilledButton.styleFrom(
                       backgroundColor: Colors.white.withValues(alpha: .18),
                       foregroundColor: Colors.white,
+                      alignment: Alignment.center,
                       padding: const EdgeInsets.all(14)),
-                  icon: const Icon(Icons.qr_code_2),
-                  label: const Text('Scan',
-                      style: TextStyle(fontWeight: FontWeight.w900)),
+                  child: const Center(
+                    child: Text('Scan',
+                        style: TextStyle(fontWeight: FontWeight.w900),
+                        textAlign: TextAlign.center),
+                  ),
                 ),
               ),
             ],
@@ -3766,10 +5309,193 @@ class WalletTransactions extends StatelessWidget {
     super.key,
     required this.services,
     required this.connect,
+    required this.paymentMethods,
+    required this.transactions,
+    required this.onAddPaymentMethodSuccess,
   });
 
   final AppServices services;
   final BackendConnector connect;
+  final List paymentMethods;
+  final List transactions;
+  final VoidCallback onAddPaymentMethodSuccess;
+
+  Future<void> _showAddPaymentMethodDialog(BuildContext context) async {
+    final holderController = TextEditingController();
+    final numberController = TextEditingController();
+    final expiryController = TextEditingController();
+    final cvvController = TextEditingController();
+    String selectedCardType = 'Visa';
+
+    final result = await showDialog<Map<String, String>>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setState) {
+            return AlertDialog(
+              title: const Text('Add Payment Method', style: TextStyle(fontWeight: FontWeight.w900)),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: holderController,
+                      decoration: const InputDecoration(
+                        labelText: 'Cardholder Name',
+                        hintText: 'John Doe',
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: numberController,
+                      keyboardType: TextInputType.number,
+                      decoration: const InputDecoration(
+                        labelText: 'Card Number',
+                        hintText: '1234 5678 1234 5678',
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextField(
+                            controller: expiryController,
+                            keyboardType: TextInputType.number,
+                            inputFormatters: [
+                              CardExpiryInputFormatter(),
+                            ],
+                            decoration: const InputDecoration(
+                              labelText: 'Expiry Date',
+                              hintText: 'MM/YY',
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: TextField(
+                            controller: cvvController,
+                            obscureText: true,
+                            keyboardType: TextInputType.number,
+                            decoration: const InputDecoration(
+                              labelText: 'CVV',
+                              hintText: '123',
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+                    DropdownButtonFormField<String>(
+                      value: selectedCardType,
+                      decoration: const InputDecoration(labelText: 'Card Type'),
+                      items: ['Visa', 'Mastercard']
+                          .map((type) => DropdownMenuItem(
+                                value: type,
+                                child: Text(type),
+                              ))
+                          .toList(),
+                      onChanged: (val) {
+                        if (val != null) {
+                          setState(() {
+                            selectedCardType = val;
+                          });
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    final name = holderController.text.trim();
+                    final number = numberController.text.trim().replaceAll(' ', '');
+                    final expiry = expiryController.text.trim();
+                    final cvv = cvvController.text.trim();
+
+                    if (name.isEmpty || number.isEmpty || expiry.isEmpty || cvv.isEmpty) {
+                      showPremiumAlert(context, 'Please fill out all fields.', isError: true);
+                      return;
+                    }
+
+                    // Cardholder Name Validation: only letters and spaces, at least 3 chars
+                    final nameRegExp = RegExp(r"^[a-zA-Z\s']+$");
+                    if (!nameRegExp.hasMatch(name) || name.length < 3) {
+                      showPremiumAlert(context, 'Please enter a valid cardholder name (letters only, min 3 chars).', isError: true);
+                      return;
+                    }
+
+                    // Card Number Validation: only digits, length 12 to 19
+                    final numberRegExp = RegExp(r"^\d{12,19}$");
+                    if (!numberRegExp.hasMatch(number)) {
+                      showPremiumAlert(context, 'Card number must be 12 to 19 digits.', isError: true);
+                      return;
+                    }
+
+                    // Expiry Date Validation: MM/YY
+                    final expiryRegExp = RegExp(r"^(0[1-9]|1[0-2])\/?([0-9]{2})$");
+                    if (!expiryRegExp.hasMatch(expiry)) {
+                      showPremiumAlert(context, 'Expiry date must be in MM/YY format.', isError: true);
+                      return;
+                    }
+                    
+                    // Expiry Date not in the past
+                    final match = expiryRegExp.firstMatch(expiry)!;
+                    final month = int.parse(match.group(1)!);
+                    final yearSuffix = int.parse(match.group(2)!);
+                    final year = 2000 + yearSuffix;
+                    final now = DateTime.now();
+                    final currentYear = now.year;
+                    final currentMonth = now.month;
+                    if (year < currentYear || (year == currentYear && month < currentMonth)) {
+                      showPremiumAlert(context, 'This card has expired.', isError: true);
+                      return;
+                    }
+
+                    // CVV Validation: 3 or 4 digits
+                    final cvvRegExp = RegExp(r"^\d{3,4}$");
+                    if (!cvvRegExp.hasMatch(cvv)) {
+                      showPremiumAlert(context, 'CVV must be 3 or 4 digits.', isError: true);
+                      return;
+                    }
+
+                    Navigator.pop(context, {
+                      'holder': name,
+                      'number': number,
+                      'expiry': expiry,
+                      'type': selectedCardType,
+                    });
+                  },
+                  style: FilledButton.styleFrom(backgroundColor: green),
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (result == null) return;
+
+    final success = await connect(
+      'Payment method',
+      () => services.addPaymentMethod(
+        cardHolder: result['holder']!,
+        cardNumber: result['number']!,
+        cardType: result['type']!,
+        expiry: result['expiry']!,
+      ),
+    );
+
+    if (success) {
+      onAddPaymentMethodSuccess();
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -3778,36 +5504,44 @@ class WalletTransactions extends StatelessWidget {
       children: [
         SectionTitle(
             title: 'Recent Transactions',
-            trailing: 'View All',
-            trailingColor: green),
+            trailing: '${transactions.length} items',
+            trailingColor: muted),
         const SizedBox(height: 14),
-        const TxTile(
-            icon: Icons.credit_card,
-            title: 'B101 - Heliopolis to Maadi',
-            time: 'Today, 3:45 PM',
-            amount: '- 15 EGP'),
-        const TxTile(
-            icon: Icons.add,
-            title: 'Wallet Top-up',
-            time: 'Today, 2:30 PM',
-            amount: '+ 100 EGP',
-            positive: true),
-        const TxTile(
-            icon: Icons.credit_card,
-            title: 'M45 - Nasr City to Downtown',
-            time: 'Yesterday, 5:20 PM',
-            amount: '- 12 EGP'),
-        const TxTile(
-            icon: Icons.credit_card,
-            title: 'B89 - 6th October to Tahrir',
-            time: 'Dec 12, 10:15 AM',
-            amount: '- 18 EGP'),
+        if (transactions.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 12),
+            child: Text(
+              'No recent transactions found.',
+              style: TextStyle(color: muted, fontSize: 13),
+            ),
+          )
+        else
+          ...transactions.map(
+            (tx) => TxTile(
+              icon: tx['type'] == 'top_up' ? Icons.add : Icons.credit_card,
+              title: tx['title']?.toString() ?? 'Transaction',
+              time: tx['timestamp']?.toString().split('T').first ?? 'Date',
+              amount: '${tx['type'] == 'top_up' ? '+' : '-'} ${tx['amount']} EGP',
+              positive: tx['type'] == 'top_up',
+            ),
+          ),
         const SizedBox(height: 18),
         const Text('Payment Methods',
             style: TextStyle(fontWeight: FontWeight.w900, fontSize: 18)),
         const SizedBox(height: 14),
         CardShell(
-          borderColor: green,
+          borderColor: !paymentMethods.any((pm) => pm['is_active'] == true) ? green : softLine,
+          onTap: () async {
+            final bool isWalletActive = !paymentMethods.any((pm) => pm['is_active'] == true);
+            if (isWalletActive) return;
+            final success = await connect(
+              'Activate IZEE Wallet',
+              () => services.deactivateAllPaymentMethods(),
+            );
+            if (success) {
+              onAddPaymentMethodSuccess();
+            }
+          },
           child: Row(
             children: [
               const _MapPin(
@@ -3824,16 +5558,111 @@ class WalletTransactions extends StatelessWidget {
                   ],
                 ),
               ),
-              _SmallTag(label: 'Active', filled: true),
+              if (!paymentMethods.any((pm) => pm['is_active'] == true))
+                _SmallTag(label: 'Active', filled: true)
+              else
+                const Icon(Icons.circle_outlined, color: muted, size: 20),
             ],
           ),
         ),
         const SizedBox(height: 10),
+        if (paymentMethods.isEmpty)
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 8),
+            child: Text(
+              'No saved credit/debit cards.',
+              style: TextStyle(color: muted, fontSize: 12),
+            ),
+          )
+        else
+          ...paymentMethods.map(
+            (pm) {
+              final bool isActive = pm['is_active'] == true;
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: CardShell(
+                  borderColor: isActive ? green : softLine,
+                  onTap: () async {
+                    if (isActive) return;
+                    final success = await connect(
+                      'Activate payment method',
+                      () => services.activatePaymentMethod(pm['id']),
+                    );
+                    if (success) {
+                      onAddPaymentMethodSuccess();
+                    }
+                  },
+                  child: Row(
+                    children: [
+                      _MapPin(
+                        icon: Icons.credit_card,
+                        bg: pm['card_type']?.toString().toLowerCase() == 'visa'
+                            ? const Color(0xFFEFF6FF)
+                            : const Color(0xFFFFF7DC),
+                        color: pm['card_type']?.toString().toLowerCase() == 'visa'
+                            ? const Color(0xFF2563EB)
+                            : const Color(0xFFF59E0B),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(pm['card_number']?.toString() ?? '**** **** **** 0000',
+                                style: const TextStyle(fontWeight: FontWeight.w800)),
+                            Text('Expires ${pm['expiry']?.toString() ?? 'MM/YY'} - ${pm['card_holder']?.toString() ?? 'Holder'}',
+                                style: const TextStyle(color: muted, fontSize: 12)),
+                          ],
+                        ),
+                      ),
+                      if (isActive)
+                        _SmallTag(label: 'Active', filled: true)
+                      else
+                        const Icon(Icons.circle_outlined, color: muted, size: 20),
+                      const SizedBox(width: 12),
+                      IconButton(
+                        icon: const Icon(Icons.delete_outline, color: rose, size: 20),
+                        padding: EdgeInsets.zero,
+                        constraints: const BoxConstraints(),
+                        onPressed: () async {
+                          final confirm = await showDialog<bool>(
+                            context: context,
+                            builder: (context) => AlertDialog(
+                              title: const Text('Remove Card', style: TextStyle(fontWeight: FontWeight.w900)),
+                              content: const Text('Are you sure you want to remove this payment card?'),
+                              actions: [
+                                TextButton(
+                                  onPressed: () => Navigator.pop(context, false),
+                                  child: const Text('Cancel'),
+                                ),
+                                TextButton(
+                                  onPressed: () => Navigator.pop(context, true),
+                                  child: const Text('Remove', style: TextStyle(color: rose)),
+                                ),
+                              ],
+                            ),
+                          );
+                          if (confirm != true) return;
+                          final success = await connect(
+                            'Remove payment method',
+                            () => services.deletePaymentMethod(pm['id']),
+                          );
+                          if (success) {
+                            onAddPaymentMethodSuccess();
+                          }
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        const SizedBox(height: 10),
         SizedBox(
           height: 54,
           child: OutlinedButton.icon(
-            onPressed: () =>
-                connect('Payment method', services.addPaymentMethod),
+            onPressed: () => _showAddPaymentMethodDialog(context),
             style: OutlinedButton.styleFrom(
               foregroundColor: muted,
               side: const BorderSide(color: softLine),
@@ -4359,41 +6188,6 @@ class DriverCard extends StatelessWidget {
     );
   }
 }
-
-class _ModeChip extends StatelessWidget {
-  const _ModeChip({required this.icon, required this.label});
-
-  final IconData icon;
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    return Container(
-      height: 44,
-      padding: const EdgeInsets.symmetric(horizontal: 8),
-      decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: .2),
-          borderRadius: BorderRadius.circular(9)),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(icon, color: Colors.white, size: 16),
-          const SizedBox(width: 6),
-          Flexible(
-            child: FittedBox(
-              fit: BoxFit.scaleDown,
-              child: Text(label,
-                  maxLines: 1,
-                  style: const TextStyle(
-                      color: Colors.white, fontWeight: FontWeight.w800)),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
 class _RoutePill extends StatelessWidget {
   const _RoutePill(this.text, {required this.mode});
 
@@ -4655,6 +6449,7 @@ class NoticeTile extends StatelessWidget {
     required this.body,
     required this.time,
     this.unread = false,
+    this.onTapMarkRead,
   });
 
   final IconData icon;
@@ -4664,6 +6459,7 @@ class NoticeTile extends StatelessWidget {
   final String body;
   final String time;
   final bool unread;
+  final VoidCallback? onTapMarkRead;
 
   @override
   Widget build(BuildContext context) {
@@ -4696,11 +6492,14 @@ class NoticeTile extends StatelessWidget {
                     Text(time,
                         style: const TextStyle(color: muted, fontSize: 12)),
                     if (unread)
-                      const Text('   Mark as read',
-                          style: TextStyle(
-                              color: green,
-                              fontSize: 12,
-                              fontWeight: FontWeight.w800)),
+                      InkWell(
+                        onTap: onTapMarkRead,
+                        child: const Text('   Mark as read',
+                            style: TextStyle(
+                                color: green,
+                                fontSize: 12,
+                                fontWeight: FontWeight.w800)),
+                      ),
                   ],
                 ),
               ],
@@ -4763,6 +6562,132 @@ class RecentSearch extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+class FavoriteSearch extends StatelessWidget {
+  const FavoriteSearch({
+    super.key,
+    required this.text,
+    this.onTap,
+    this.onDelete,
+  });
+
+  final String text;
+  final VoidCallback? onTap;
+  final VoidCallback? onDelete;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: const Color(0xFFF4F4F5),
+        borderRadius: BorderRadius.circular(12),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(12),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            child: Row(
+              children: [
+                const Icon(Icons.star, color: Colors.amber, size: 18),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Text(
+                    text,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontWeight: FontWeight.w800),
+                  ),
+                ),
+                if (onDelete != null) ...[
+                  const SizedBox(width: 8),
+                  IconButton(
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    icon: const Icon(Icons.delete_outline, color: rose, size: 18),
+                    onPressed: onDelete,
+                  ),
+                ] else if (onTap != null) ...[
+                  const SizedBox(width: 8),
+                  const Icon(Icons.north_east, color: muted, size: 16),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class FavoritesScreen extends StatefulWidget {
+  const FavoritesScreen({
+    super.key,
+    required this.session,
+    required this.onBack,
+    required this.onSelectFavorite,
+    required this.onDeleteFavorite,
+  });
+
+  final PlanTripSession session;
+  final VoidCallback onBack;
+  final ValueChanged<FavoriteTrip> onSelectFavorite;
+  final ValueChanged<FavoriteTrip> onDeleteFavorite;
+
+  @override
+  State<FavoritesScreen> createState() => _FavoritesScreenState();
+}
+
+class _FavoritesScreenState extends State<FavoritesScreen> {
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          color: green,
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+          child: SafeArea(
+            bottom: false,
+            child: HeaderRow(title: 'Favorites', onBack: widget.onBack),
+          ),
+        ),
+        Expanded(
+          child: widget.session.favoriteSearches.isEmpty
+              ? const Center(
+                  child: Padding(
+                    padding: EdgeInsets.all(24),
+                    child: Text(
+                      'No favorite places yet',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: muted,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                )
+              : ListView.builder(
+                  padding: const EdgeInsets.fromLTRB(18, 22, 18, 18),
+                  itemCount: widget.session.favoriteSearches.length,
+                  itemBuilder: (context, index) {
+                    final item = widget.session.favoriteSearches[index];
+                    return FavoriteSearch(
+                      text: item.label,
+                      onTap: () => widget.onSelectFavorite(item),
+                      onDelete: () {
+                        widget.onDeleteFavorite(item);
+                        setState(() {
+                          widget.session.favoriteSearches.removeAt(index);
+                        });
+                      },
+                    );
+                  },
+                ),
+        ),
+      ],
     );
   }
 }
@@ -4908,7 +6833,9 @@ class MenuItem extends StatelessWidget {
 }
 
 class ProfileSummaryCard extends StatelessWidget {
-  const ProfileSummaryCard({super.key});
+  const ProfileSummaryCard({super.key, required this.onSettings});
+
+  final VoidCallback onSettings;
 
   @override
   Widget build(BuildContext context) {
@@ -4945,7 +6872,7 @@ class ProfileSummaryCard extends StatelessWidget {
                 ),
               ),
               IconButton(
-                onPressed: () {},
+                onPressed: onSettings,
                 icon: const Icon(Icons.settings_outlined, color: green),
               ),
             ],
@@ -5177,5 +7104,1330 @@ class SimpleListScreen extends StatelessWidget {
         ),
       ],
     );
+  }
+}
+
+class CardExpiryInputFormatter extends TextInputFormatter {
+  @override
+  TextEditingValue formatEditUpdate(
+      TextEditingValue oldValue, TextEditingValue newValue) {
+    final newText = newValue.text;
+    
+    if (newValue.selection.baseOffset == 0) {
+      return newValue;
+    }
+    
+    // Clean any non-digit character
+    final cleanText = newText.replaceAll(RegExp(r'\D'), '');
+    
+    if (cleanText.length > 4) {
+      return oldValue;
+    }
+    
+    final formattedBuffer = StringBuffer();
+    for (int i = 0; i < cleanText.length; i++) {
+      formattedBuffer.write(cleanText[i]);
+      final nonZeroIndex = i + 1;
+      if (nonZeroIndex == 2 && nonZeroIndex != cleanText.length) {
+        formattedBuffer.write('/');
+      }
+    }
+    
+    final formattedString = formattedBuffer.toString();
+    return TextEditingValue(
+      text: formattedString,
+      selection: TextSelection.collapsed(offset: formattedString.length),
+    );
+  }
+}
+
+void showPremiumAlert(BuildContext context, String message, {bool isError = false}) {
+  showDialog(
+    context: context,
+    barrierDismissible: true,
+    builder: (context) {
+      return Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        elevation: 10,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: isError ? const Color(0xFFFFE4E6) : const Color(0xFFECFDF5),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(
+                  isError ? Icons.warning_amber_rounded : Icons.check_circle_outline,
+                  color: isError ? const Color(0xFFE11D48) : const Color(0xFF10B981),
+                  size: 40,
+                ),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                isError ? 'Alert' : 'Success',
+                style: const TextStyle(
+                  fontWeight: FontWeight.w900,
+                  fontSize: 18,
+                  color: Color(0xFF0F172A),
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: Color(0xFF64748B),
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 22),
+              SizedBox(
+                width: double.infinity,
+                height: 48,
+                child: FilledButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: isError ? const Color(0xFFE11D48) : const Color(0xFF10B981),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                  ),
+                  child: const Text(
+                    'OK',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w800,
+                      fontSize: 15,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
+class ReportIncidentScreen extends StatefulWidget {
+  const ReportIncidentScreen({
+    super.key,
+    required this.services,
+    required this.connect,
+    required this.onGo,
+    this.prefilledRouteId,
+    this.prefilledVehicleId,
+  });
+
+  final AppServices services;
+  final BackendConnector connect;
+  final ValueChanged<AppScreen> onGo;
+  final String? prefilledRouteId;
+  final String? prefilledVehicleId;
+
+  @override
+  State<ReportIncidentScreen> createState() => _ReportIncidentScreenState();
+}
+
+class _ReportIncidentScreenState extends State<ReportIncidentScreen> {
+  final _formKey = GlobalKey<FormState>();
+  String _category = 'Delay';
+  String _severity = 'warning'; // 'minor', 'warning', 'critical'
+  final _detailsController = TextEditingController();
+  final _vehicleController = TextEditingController();
+  final _routeController = TextEditingController();
+  final _locationController = TextEditingController();
+  double? _lat;
+  double? _lon;
+
+  final List<String> _categories = [
+    'Delay',
+    'Accident',
+    'Breakdown',
+    'Crowding',
+    'Driver Behavior',
+    'Lost & Found',
+    'Other'
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    _autoPopulateData();
+  }
+
+  Future<void> _autoPopulateData() async {
+    if (widget.prefilledRouteId != null) {
+      _routeController.text = widget.prefilledRouteId!;
+    }
+    if (widget.prefilledVehicleId != null) {
+      _vehicleController.text = widget.prefilledVehicleId!;
+    }
+
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return;
+
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.always || permission == LocationPermission.whileInUse) {
+        final position = await Geolocator.getCurrentPosition(
+          desiredAccuracy: LocationAccuracy.medium,
+        );
+        if (!mounted) return;
+        setState(() {
+          _lat = position.latitude;
+          _lon = position.longitude;
+          _locationController.text = 'GPS: ${position.latitude.toStringAsFixed(4)}, ${position.longitude.toStringAsFixed(4)}';
+        });
+      }
+    } catch (e) {
+      debugPrint('Technical error auto-populating location: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      children: [
+        Container(
+          color: green,
+          padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+          child: SafeArea(
+            bottom: false,
+            child: HeaderRow(
+              title: 'Report Incident',
+              onBack: () => widget.onGo(AppScreen.home),
+            ),
+          ),
+        ),
+        Expanded(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(20),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'Incident Category *',
+                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: ink),
+                  ),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<String>(
+                    value: _category,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                    items: _categories.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(),
+                    onChanged: (val) {
+                      if (val != null) setState(() => _category = val);
+                    },
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    'Severity Level *',
+                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: ink),
+                  ),
+                  const SizedBox(height: 8),
+                  Row(
+                    children: [
+                      _severityChip('minor', 'Minor', Colors.blue),
+                      const SizedBox(width: 10),
+                      _severityChip('warning', 'Warning', Colors.orange),
+                      const SizedBox(width: 10),
+                      _severityChip('critical', 'Critical', rose),
+                    ],
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    'Description / Details *',
+                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: ink),
+                  ),
+                  const SizedBox(height: 8),
+                  TextFormField(
+                    controller: _detailsController,
+                    maxLines: 5,
+                    decoration: const InputDecoration(
+                      hintText: 'Describe the incident in detail...',
+                      border: OutlineInputBorder(),
+                    ),
+                    validator: (val) {
+                      if (val == null || val.trim().isEmpty) {
+                        return 'Description is required';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    'Location Description (Optional)',
+                    style: TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: ink),
+                  ),
+                  const SizedBox(height: 8),
+                  TextFormField(
+                    controller: _locationController,
+                    decoration: const InputDecoration(
+                      hintText: 'e.g. Abbassia Station, near the gate',
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Vehicle ID (Optional)',
+                              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: ink),
+                            ),
+                            const SizedBox(height: 8),
+                            TextFormField(
+                              controller: _vehicleController,
+                              decoration: const InputDecoration(
+                                hintText: 'e.g. V-001',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 16),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            const Text(
+                              'Route ID (Optional)',
+                              style: TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: ink),
+                            ),
+                            const SizedBox(height: 8),
+                            TextFormField(
+                              controller: _routeController,
+                              decoration: const InputDecoration(
+                                hintText: 'e.g. Route 45',
+                                border: OutlineInputBorder(),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 30),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: FilledButton(
+                      onPressed: _submit,
+                      style: FilledButton.styleFrom(
+                        backgroundColor: green,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                      ),
+                      child: const Center(
+                        child: Text(
+                          'Submit Report',
+                          style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: Colors.white),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _severityChip(String value, String label, Color color) {
+    final active = _severity == value;
+    return Expanded(
+      child: InkWell(
+        onTap: () => setState(() => _severity = value),
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: active ? color.withValues(alpha: .15) : Colors.transparent,
+            border: Border.all(color: active ? color : muted, width: active ? 2 : 1),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Center(
+            child: Text(
+              label,
+              style: TextStyle(
+                fontWeight: active ? FontWeight.w900 : FontWeight.w600,
+                color: active ? color : ink,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _submit() async {
+    if (!_formKey.currentState!.validate()) return;
+    
+    final success = await widget.connect('Submitting incident report', () async {
+      await widget.services.reportIncident(
+        category: _category,
+        severity: _severity,
+        details: _detailsController.text.trim(),
+        vehicleId: _vehicleController.text.trim().isEmpty ? null : _vehicleController.text.trim(),
+        routeId: _routeController.text.trim().isEmpty ? null : _routeController.text.trim(),
+        locationLabel: _locationController.text.trim().isEmpty ? null : _locationController.text.trim(),
+        lat: _lat,
+        lon: _lon,
+      );
+      return {};
+    });
+
+    if (success) {
+      if (!mounted) return;
+      widget.onGo(AppScreen.home);
+    }
+  }
+
+  @override
+  void dispose() {
+    _detailsController.dispose();
+    _vehicleController.dispose();
+    _routeController.dispose();
+    _locationController.dispose();
+    super.dispose();
+  }
+}
+
+class NavigationScreen extends StatefulWidget {
+  const NavigationScreen({super.key, required this.selectedRoute});
+  final Map<String, dynamic> selectedRoute;
+
+  @override
+  State<NavigationScreen> createState() => _NavigationScreenState();
+}
+
+class _NavigationScreenState extends State<NavigationScreen> {
+  final MapController _mapController = MapController();
+  StreamSubscription<Position>? _positionSubscription;
+  LatLng? _userLocation;
+  double? _userHeading;
+  bool _followUser = true;
+
+  List<Map<String, dynamic>> _steps = [];
+  List<Map<String, dynamic>> _stops = [];
+  int _currentStepIndex = 0;
+  int _currentRideStopIndex = 0;
+  bool _showStopsList = false;
+  bool _destinationReached = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _extractStepsAndStops();
+    _startLocationTracking();
+  }
+
+  @override
+  void dispose() {
+    _positionSubscription?.cancel();
+    super.dispose();
+  }
+
+  void _extractStepsAndStops() {
+    // Extract steps
+    final backendSteps = widget.selectedRoute['navigation_steps'];
+    if (backendSteps is List && backendSteps.isNotEmpty) {
+      _steps = backendSteps.map((step) {
+        final stepMap = Map<String, dynamic>.from(step);
+        // Ensure targetStop is parsed
+        if (stepMap['target_stop'] is Map) {
+          stepMap['targetStop'] = Map<String, dynamic>.from(stepMap['target_stop']);
+        }
+        return stepMap;
+      }).toList();
+    } else {
+      _steps = _generateStepsLocally();
+    }
+
+    // Extract all stops
+    _stops = [];
+    final legs = widget.selectedRoute['legs'];
+    if (legs is List) {
+      for (final leg in legs) {
+        if (leg is Map<String, dynamic>) {
+          final ordered = leg['ordered_stops'];
+          if (ordered is List) {
+            for (final stop in ordered) {
+              if (stop is Map<String, dynamic>) {
+                if (!_stops.any((s) => s['stop_id'] == stop['stop_id'])) {
+                  _stops.add(Map<String, dynamic>.from(stop));
+                }
+              }
+            }
+          } else {
+            final fromStop = leg['from_stop'];
+            if (fromStop is Map<String, dynamic>) {
+              if (!_stops.any((s) => s['stop_id'] == fromStop['stop_id'])) {
+                _stops.add(Map<String, dynamic>.from(fromStop));
+              }
+            }
+            final toStop = leg['to_stop'];
+            if (toStop is Map<String, dynamic>) {
+              if (!_stops.any((s) => s['stop_id'] == toStop['stop_id'])) {
+                _stops.add(Map<String, dynamic>.from(toStop));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  List<Map<String, dynamic>> _generateStepsLocally() {
+    final steps = <Map<String, dynamic>>[];
+    final legs = widget.selectedRoute['legs'];
+    if (legs is List) {
+      for (final leg in legs) {
+        if (leg is Map<String, dynamic>) {
+          final mode = (leg['mode'] ?? '').toString().toLowerCase();
+          final fromStop = leg['from_stop'] as Map<String, dynamic>? ?? {};
+          final toStop = leg['to_stop'] as Map<String, dynamic>? ?? {};
+          final orderedStops = leg['ordered_stops'] as List? ?? [];
+          
+          if (mode.contains('walk')) {
+            final dist = leg['distance_meters'] ?? 0.0;
+            final distStr = dist > 0 ? ' (${dist.toStringAsFixed(0)}m)' : '';
+            steps.add({
+              'instruction': 'Walk to ${toStop['name'] ?? 'Stop'}$distStr',
+              'type': 'walk',
+              'targetStop': toStop,
+              'distance_meters': dist,
+            });
+          } else {
+            final routeLabel = leg['route_label'] ?? leg['route_id'] ?? 'Transit';
+            steps.add({
+              'instruction': 'Board $routeLabel at ${fromStop['name']}',
+              'type': 'board',
+              'targetStop': fromStop,
+              'route_label': routeLabel,
+            });
+            
+            final rideCount = orderedStops.isNotEmpty ? orderedStops.length - 1 : 1;
+            steps.add({
+              'instruction': 'Ride for $rideCount stop${rideCount > 1 ? 's' : ''}',
+              'type': 'ride',
+              'targetStop': toStop,
+              'stop_count': rideCount,
+              'stops': orderedStops,
+            });
+            
+            steps.add({
+              'instruction': 'Get off at ${toStop['name']}',
+              'type': 'alight',
+              'targetStop': toStop,
+            });
+          }
+        }
+      }
+    }
+    return steps;
+  }
+
+  Future<void> _startLocationTracking() async {
+    try {
+      final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+      if (!serviceEnabled) return;
+      var permission = await Geolocator.checkPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
+      }
+      if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
+        return;
+      }
+      
+      final initialPos = await Geolocator.getCurrentPosition(desiredAccuracy: LocationAccuracy.high);
+      if (mounted) {
+        setState(() {
+          _userLocation = LatLng(initialPos.latitude, initialPos.longitude);
+          _userHeading = initialPos.heading;
+        });
+        _mapController.move(_userLocation!, 16.0);
+      }
+
+      _positionSubscription = Geolocator.getPositionStream(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 2,
+        ),
+      ).listen((Position position) {
+        if (!mounted) return;
+        setState(() {
+          _userLocation = LatLng(position.latitude, position.longitude);
+          _userHeading = position.heading;
+          _updateNavigationProgress();
+        });
+        if (_followUser) {
+          _mapController.move(_userLocation!, _mapController.camera.zoom);
+        }
+      });
+    } catch (e) {
+      debugPrint('Error in navigation location tracking: $e');
+    }
+  }
+
+  void _updateNavigationProgress() {
+    if (_steps.isEmpty || _currentStepIndex >= _steps.length) return;
+    if (_userLocation == null) return;
+
+    final currentStep = _steps[_currentStepIndex];
+    final stepType = currentStep['type'] as String?;
+    
+    if (stepType == 'ride') {
+      final stopsList = currentStep['stops'] as List? ?? [];
+      if (stopsList.isNotEmpty) {
+        // Find if we have reached any upcoming stop in the ride
+        for (int i = _currentRideStopIndex + 1; i < stopsList.length; i++) {
+          final stop = stopsList[i] as Map<String, dynamic>;
+          final lat = _asDouble(stop['lat']);
+          final lon = _asDouble(stop['lon']);
+          if (lat != null && lon != null) {
+            final dist = _haversineDistance(_userLocation!, LatLng(lat, lon));
+            if (dist < 40.0) {
+              setState(() {
+                _currentRideStopIndex = i;
+              });
+              // If we reached the final stop of the ride, auto-advance the step!
+              if (i == stopsList.length - 1) {
+                _advanceStep();
+              } else {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text('Passed stop: ${stop['name']}'),
+                    duration: const Duration(seconds: 3),
+                    backgroundColor: Colors.blue,
+                  ),
+                );
+              }
+              break;
+            }
+          }
+        }
+        return;
+      }
+    }
+
+    // Default target stop distance check (for walk, board, alight steps)
+    final targetStop = currentStep['targetStop'];
+    if (targetStop == null) return;
+
+    final targetLat = _asDouble(targetStop['lat']);
+    final targetLon = _asDouble(targetStop['lon']);
+    if (targetLat == null || targetLon == null) return;
+
+    final dist = _haversineDistance(_userLocation!, LatLng(targetLat, targetLon));
+    
+    // Auto-advance if close to the target stop (threshold: 30 meters)
+    if (dist < 30.0) {
+      _advanceStep();
+    }
+  }
+
+  void _advanceStep() {
+    if (_currentStepIndex < _steps.length - 1) {
+      setState(() {
+        _currentStepIndex++;
+        _currentRideStopIndex = 0;
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Next Step: ${_steps[_currentStepIndex]['instruction']}'),
+          duration: const Duration(seconds: 4),
+          backgroundColor: green,
+        ),
+      );
+      // Board/alight steps often share the same coordinates as the adjacent
+      // ride stop. Re-check without waiting for another GPS movement event.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && !_destinationReached) _updateNavigationProgress();
+      });
+    } else {
+      _completeNavigation();
+    }
+  }
+
+  void _completeNavigation() {
+    if (_destinationReached) return;
+    _destinationReached = true;
+    _positionSubscription?.cancel();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) Navigator.of(context).pop(true);
+    });
+  }
+
+  double _haversineDistance(LatLng p1, LatLng p2) {
+    const r = 6371000.0; // Earth radius in meters
+    final dLat = (p2.latitude - p1.latitude) * math.pi / 180.0;
+    final dLon = (p2.longitude - p1.longitude) * math.pi / 180.0;
+    final a = math.sin(dLat / 2.0) * math.sin(dLat / 2.0) +
+        math.cos(p1.latitude * math.pi / 180.0) *
+            math.cos(p2.latitude * math.pi / 180.0) *
+            math.sin(dLon / 2.0) *
+            math.sin(dLon / 2.0);
+    final c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a));
+    return r * c;
+  }
+
+  double? _asDouble(Object? value) {
+    if (value is num) return value.toDouble();
+    if (value == null) return null;
+    return double.tryParse(value.toString());
+  }
+
+  String _getStopStatus(String stopId) {
+    for (int j = 0; j < _steps.length; j++) {
+      final step = _steps[j];
+      final stepType = step['type'] as String?;
+      
+      if (j < _currentStepIndex) {
+        if (stepType == 'ride') {
+          final stops = step['stops'] as List? ?? [];
+          if (stops.any((s) => s['stop_id']?.toString() == stopId)) {
+            return 'passed';
+          }
+        } else {
+          final target = step['targetStop'];
+          if (target != null && target['stop_id']?.toString() == stopId) {
+            return 'passed';
+          }
+        }
+      } else if (j == _currentStepIndex) {
+        if (stepType == 'ride') {
+          final stops = step['stops'] as List? ?? [];
+          for (int i = 0; i < stops.length; i++) {
+            final sId = stops[i]['stop_id']?.toString();
+            if (sId == stopId) {
+              if (i <= _currentRideStopIndex) {
+                return 'passed';
+              } else if (i == _currentRideStopIndex + 1) {
+                return 'active';
+              } else {
+                return 'upcoming';
+              }
+            }
+          }
+        } else {
+          final target = step['targetStop'];
+          if (target != null && target['stop_id']?.toString() == stopId) {
+            return 'active';
+          }
+        }
+      } else {
+        if (stepType == 'ride') {
+          final stops = step['stops'] as List? ?? [];
+          if (stops.any((s) => s['stop_id']?.toString() == stopId)) {
+            return 'upcoming';
+          }
+        } else {
+          final target = step['targetStop'];
+          if (target != null && target['stop_id']?.toString() == stopId) {
+            return 'upcoming';
+          }
+        }
+      }
+    }
+    return 'upcoming';
+  }
+
+  Widget _buildStopMarker(Map<String, dynamic> stop) {
+    final status = _getStopStatus(stop['stop_id']?.toString() ?? '');
+    Color borderCol;
+    Color bgCol;
+    double size;
+    Widget? childWidget;
+
+    if (status == 'passed') {
+      borderCol = Colors.grey;
+      bgCol = Colors.grey.shade300;
+      size = 12.0;
+      childWidget = const Icon(Icons.check, size: 8, color: Colors.grey);
+    } else if (status == 'active') {
+      borderCol = Colors.orange.shade700;
+      bgCol = Colors.orange.shade100;
+      size = 18.0;
+      childWidget = Container(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: Colors.orange.shade700,
+        ),
+        margin: const EdgeInsets.all(3),
+      );
+    } else {
+      borderCol = Colors.blue.shade700;
+      bgCol = Colors.white;
+      size = 14.0;
+    }
+
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: bgCol,
+        border: Border.all(color: borderCol, width: 2),
+      ),
+      child: childWidget,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final route = widget.selectedRoute;
+    final routeName = route['mode_summary'] ?? 'Passenger Navigation';
+    final duration = route['total_travel_time'] != null
+        ? '${(route['total_travel_time'] / 60).round()} min'
+        : 'Unknown duration';
+
+    // Parse legs to segments for the polyline
+    final legs = route['legs'];
+    final segments = <_MapLegSegment>[];
+    final allPoints = <LatLng>[];
+    if (legs is List) {
+      for (final leg in legs) {
+        if (leg is Map<String, dynamic>) {
+          final geometry = leg['geometry'];
+          final points = <LatLng>[];
+          if (geometry is List) {
+            for (final point in geometry) {
+              final parsed = _pointFromGeometry(point);
+              if (parsed != null) points.add(parsed);
+            }
+          }
+          if (points.length < 2) {
+            final from = _pointFromStop(leg['from_stop']);
+            final to = _pointFromStop(leg['to_stop']);
+            if (from != null && to != null) {
+              points.addAll([from, to]);
+            }
+          }
+          if (points.isNotEmpty) {
+            allPoints.addAll(points);
+            segments.add(_MapLegSegment(
+              mode: (leg['mode'] ?? '').toString(),
+              label: (leg['route_label'] ?? leg['route_id'] ?? '').toString(),
+              points: points,
+            ));
+          }
+        }
+      }
+    }
+
+    final bounds = allPoints.isNotEmpty
+        ? LatLngBounds.fromPoints(allPoints)
+        : LatLngBounds.fromPoints([const LatLng(30.0444, 31.2357)]);
+
+    // Determine current instruction and next stop
+    final currentStep = _steps.isNotEmpty && _currentStepIndex < _steps.length
+        ? _steps[_currentStepIndex]
+        : null;
+    final stepType = currentStep != null ? currentStep['type'] as String? : '';
+    final stopsList = currentStep != null ? currentStep['stops'] as List? ?? [] : [];
+
+    final currentInstruction = currentStep != null
+        ? currentStep['instruction'] as String
+        : 'Navigation Complete';
+
+    final nextStopMap = currentStep != null
+        ? currentStep['targetStop'] as Map<String, dynamic>?
+        : null;
+    final nextStopName = nextStopMap != null ? (nextStopMap['name'] ?? 'Destination') : 'Destination';
+
+    double distanceToNext = 0.0;
+    if (_userLocation != null && nextStopMap != null) {
+      final nextLat = _asDouble(nextStopMap['lat']);
+      final nextLon = _asDouble(nextStopMap['lon']);
+      if (nextLat != null && nextLon != null) {
+        distanceToNext = _haversineDistance(_userLocation!, LatLng(nextLat, nextLon));
+      }
+    }
+    final distanceStr = distanceToNext >= 1000
+        ? '${(distanceToNext / 1000).toStringAsFixed(1)} km'
+        : '${distanceToNext.toStringAsFixed(0)} m';
+    final fallbackTravelTime = currentStep?['travel_time'];
+    final nextStopDuration = estimateNextStopDuration(
+      distanceMeters: distanceToNext,
+      locationAvailable: _userLocation != null,
+      stepType: stepType,
+      fallbackSeconds: fallbackTravelTime is num ? fallbackTravelTime : null,
+    );
+
+    // Boarding, Alighting stops for styling markers
+    final boardingStop = legs is List && legs.isNotEmpty ? legs.first['from_stop'] : null;
+    final destinationStop = legs is List && legs.isNotEmpty ? legs.last['to_stop'] : null;
+
+    final remainingStopsCount = _calculateRemainingStops();
+
+    return Scaffold(
+      body: Stack(
+        children: [
+          // FlutterMap Canvas
+          Positioned.fill(
+            child: FlutterMap(
+              mapController: _mapController,
+              options: MapOptions(
+                initialCenter: _userLocation ?? bounds.center,
+                initialZoom: 15,
+                interactionOptions: const InteractionOptions(
+                  flags: InteractiveFlag.all,
+                ),
+                onPositionChanged: (position, hasGesture) {
+                  if (hasGesture) {
+                    setState(() {
+                      _followUser = false;
+                    });
+                  }
+                },
+              ),
+              children: [
+                TileLayer(
+                  urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  userAgentPackageName: 'com.izee.passenger',
+                ),
+                PolylineLayer(
+                  polylines: [
+                    for (final segment in segments)
+                      Polyline(
+                        points: segment.points,
+                        color: colorForMode(segment.mode),
+                        strokeWidth: segment.mode.toLowerCase().contains('walk') ? 4 : 6,
+                      ),
+                  ],
+                ),
+                MarkerLayer(
+                  markers: [
+                    // User Location Marker
+                    if (_userLocation != null)
+                      Marker(
+                        point: _userLocation!,
+                        width: 48,
+                        height: 48,
+                        child: _UserLocationMarker(heading: _userHeading),
+                      ),
+                    // Intermediate Stops Markers
+                    for (final stop in _stops)
+                      if (stop['stop_id'] != boardingStop?['stop_id'] && stop['stop_id'] != destinationStop?['stop_id'])
+                        Marker(
+                          point: LatLng(_asDouble(stop['lat'])!, _asDouble(stop['lon'])!),
+                          width: 24,
+                          height: 24,
+                          child: Center(
+                            child: _buildStopMarker(stop),
+                          ),
+                        ),
+                    // Boarding Stop Marker
+                    if (boardingStop != null)
+                      Marker(
+                        point: LatLng(_asDouble(boardingStop['lat'])!, _asDouble(boardingStop['lon'])!),
+                        width: 36,
+                        height: 36,
+                        child: const _MapPin(icon: Icons.navigation, bg: green, color: Colors.white),
+                      ),
+                    // Destination Marker
+                    if (destinationStop != null)
+                      Marker(
+                        point: LatLng(_asDouble(destinationStop['lat'])!, _asDouble(destinationStop['lon'])!),
+                        width: 36,
+                        height: 36,
+                        child: const _MapPin(icon: Icons.location_on, bg: rose, color: Colors.white),
+                      ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+
+          // Floating Back/Exit Button
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 10,
+            left: 16,
+            child: FloatingActionButton.small(
+              heroTag: 'exit_nav',
+              backgroundColor: Colors.white,
+              foregroundColor: ink,
+              onPressed: () => Navigator.pop(context),
+              child: const Icon(Icons.close),
+            ),
+          ),
+
+          // Floating Re-Center Button
+          Positioned(
+            bottom: 270,
+            right: 16,
+            child: Column(
+              children: [
+                // Debug Skip Step Button
+                FloatingActionButton.small(
+                  heroTag: 'skip_step_debug',
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.orange,
+                  onPressed: _skipStepDebug,
+                  tooltip: 'Skip Step (Debug)',
+                  child: const Icon(Icons.skip_next),
+                ),
+                const SizedBox(height: 10),
+                FloatingActionButton.small(
+                  heroTag: 'recenter_nav',
+                  backgroundColor: _followUser ? green : Colors.white,
+                  foregroundColor: _followUser ? Colors.white : green,
+                  onPressed: () {
+                    setState(() {
+                      _followUser = true;
+                    });
+                    if (_userLocation != null) {
+                      _mapController.move(_userLocation!, 16.0);
+                    }
+                  },
+                  child: const Icon(Icons.my_location),
+                ),
+              ],
+            ),
+          ),
+
+          // Top Info Card
+          Positioned(
+            top: MediaQuery.of(context).padding.top + 10,
+            left: 70,
+            right: 16,
+            child: Card(
+              elevation: 4,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+              color: Colors.white,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Text(
+                            routeName,
+                            style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: ink),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          const SizedBox(height: 2),
+                          Row(
+                            children: [
+                              Text(
+                                duration,
+                                style: const TextStyle(fontWeight: FontWeight.w700, color: green, fontSize: 13),
+                              ),
+                              const SizedBox(width: 8),
+                              const Icon(Icons.fiber_manual_record, size: 6, color: muted),
+                              const SizedBox(width: 8),
+                              Text(
+                                '$remainingStopsCount stops remaining',
+                                style: const TextStyle(color: muted, fontSize: 13),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Icon(Icons.directions, color: green, size: 28),
+                  ],
+                ),
+              ),
+            ),
+          ),
+
+          // Bottom Step Card
+          Positioned(
+            bottom: MediaQuery.of(context).padding.bottom + 16,
+            left: 16,
+            right: 16,
+            child: Card(
+              elevation: 6,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              color: Colors.white,
+              child: Padding(
+                padding: const EdgeInsets.all(18),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Row(
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: green.withValues(alpha: 0.12),
+                          ),
+                          child: Icon(
+                            _getIconForStepType(_steps.isNotEmpty && _currentStepIndex < _steps.length
+                                ? _steps[_currentStepIndex]['type'] as String?
+                                : ''),
+                            color: green,
+                            size: 24,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'CURRENT INSTRUCTION',
+                                style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                currentInstruction,
+                                style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 18, color: ink),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                    const Divider(height: 24),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              const Text(
+                                'NEXT STOP',
+                                style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                nextStopName,
+                                style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: ink),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ],
+                          ),
+                        ),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            const Text(
+                              'DISTANCE',
+                              style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              distanceStr,
+                              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: green),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(width: 18),
+                        Column(
+                          crossAxisAlignment: CrossAxisAlignment.end,
+                          children: [
+                            const Text(
+                              'ETA',
+                              style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              nextStopDuration,
+                              style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: green),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                    if (stepType == 'ride') ...[
+                      const Divider(height: 16),
+                      InkWell(
+                        onTap: () {
+                          setState(() {
+                            _showStopsList = !_showStopsList;
+                          });
+                        },
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(vertical: 4),
+                          child: Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                _showStopsList ? 'Hide Stops List' : 'Show Stops List',
+                                style: const TextStyle(fontWeight: FontWeight.w700, color: green, fontSize: 13),
+                              ),
+                              Icon(
+                                _showStopsList ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                                color: green,
+                                size: 20,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                      if (_showStopsList) ...[
+                        const SizedBox(height: 8),
+                        Container(
+                          constraints: const BoxConstraints(maxHeight: 150),
+                          child: ListView.builder(
+                            shrinkWrap: true,
+                            physics: const ClampingScrollPhysics(),
+                            padding: EdgeInsets.zero,
+                            itemCount: stopsList.length,
+                            itemBuilder: (context, idx) {
+                              final stop = stopsList[idx];
+                              final stopId = stop['stop_id']?.toString() ?? '';
+                              final status = _getStopStatus(stopId);
+                              
+                              Color dotColor;
+                              TextStyle textStyle;
+                              IconData dotIcon;
+
+                              if (status == 'passed') {
+                                dotColor = Colors.grey;
+                                textStyle = const TextStyle(color: Colors.grey, decoration: TextDecoration.lineThrough, fontSize: 13);
+                                dotIcon = Icons.check_circle_outline;
+                              } else if (status == 'active') {
+                                dotColor = Colors.orange;
+                                textStyle = const TextStyle(color: ink, fontWeight: FontWeight.bold, fontSize: 13);
+                                dotIcon = Icons.radio_button_checked;
+                              } else {
+                                dotColor = Colors.blue;
+                                textStyle = const TextStyle(color: ink, fontSize: 13);
+                                dotIcon = Icons.radio_button_off;
+                              }
+
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 4),
+                                child: Row(
+                                  children: [
+                                    Icon(dotIcon, size: 16, color: dotColor),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        stop['name'] ?? 'Stop',
+                                        style: textStyle,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  int _calculateRemainingStops() {
+    int total = 0;
+    for (var i = _currentStepIndex; i < _steps.length; i++) {
+      final step = _steps[i];
+      if (step['type'] == 'ride') {
+        final count = step['stop_count'] ?? 1;
+        total += count as int;
+      }
+    }
+    return total;
+  }
+
+  IconData _getIconForStepType(String? type) {
+    switch (type) {
+      case 'walk':
+        return Icons.directions_walk;
+      case 'board':
+        return Icons.directions_bus;
+      case 'ride':
+        return Icons.trending_flat;
+      case 'alight':
+        return Icons.hail;
+      default:
+        return Icons.navigation;
+    }
+  }
+
+  void _skipStepDebug() {
+    final currentStep = _steps[_currentStepIndex];
+    if (currentStep['type'] == 'ride') {
+      final stopsList = currentStep['stops'] as List? ?? [];
+      if (stopsList.isNotEmpty && _currentRideStopIndex < stopsList.length - 1) {
+        setState(() {
+          _currentRideStopIndex++;
+        });
+        final nextStop = stopsList[_currentRideStopIndex];
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Debug: Skipped to stop ${nextStop['name']}'),
+            duration: const Duration(seconds: 2),
+            backgroundColor: Colors.orange,
+          ),
+        );
+        if (_currentRideStopIndex == stopsList.length - 1) {
+          _advanceStep();
+        }
+        return;
+      }
+    }
+
+    if (_currentStepIndex < _steps.length - 1) {
+      _advanceStep();
+    } else {
+      _completeNavigation();
+    }
+  }
+
+  LatLng? _pointFromGeometry(Object? point) {
+    if (point is List && point.length >= 2) {
+      final lat = point[0];
+      final lon = point[1];
+      if (lat is num && lon is num) {
+        return LatLng(lat.toDouble(), lon.toDouble());
+      }
+    }
+    if (point is Map) {
+      final lat = point['lat'] ?? point['latitude'];
+      final lon = point['lon'] ?? point['lng'] ?? point['longitude'];
+      if (lat is num && lon is num) {
+        return LatLng(lat.toDouble(), lon.toDouble());
+      }
+    }
+    return null;
+  }
+
+  LatLng? _pointFromStop(Object? stop) {
+    if (stop is! Map) return null;
+    final lat = stop['lat'] ?? stop['latitude'];
+    final lon = stop['lon'] ?? stop['lng'] ?? stop['longitude'];
+    if (lat is num && lon is num) {
+      return LatLng(lat.toDouble(), lon.toDouble());
+    }
+    return null;
   }
 }

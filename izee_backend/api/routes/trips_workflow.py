@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, status, Request, Query
+from fastapi import APIRouter, HTTPException, Depends, status, Request, Query, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from database.connection import SessionLocal, Base
 from models.trips_workflow import (
@@ -27,6 +27,27 @@ import uuid
 import datetime
 
 router = APIRouter()
+
+# Messaging presence is deliberately in memory. Database users are never
+# treated as connected; a user exists here only while its message socket lives.
+message_clients: dict[tuple[str, str], dict] = {}
+# HTTP polling fallback retained for the existing Active Recipients behavior.
+http_presence: dict[tuple[str, str], datetime.datetime] = {}
+
+
+def _save_message_last_seen(user_id: str, timestamp: str, status: str | None = None) -> None:
+    """Persist the final messaging activity without using users as presence."""
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.user_id == user_id).first()
+        if user:
+            user.last_active = timestamp
+            if status and user.status != "suspended":
+                user.status = status
+            db.commit()
+    finally:
+        db.close()
+
 
 # Dependency to get db session
 def get_db():
@@ -1261,8 +1282,16 @@ def get_profile(request: Request):
     }
 
 @router.get("/incidents")
-def get_incidents(limit: int = 100, db: Session = Depends(get_db)):
-    rows = db.query(TransitIncident).order_by(TransitIncident.created_at.desc()).limit(limit).all()
+def get_incidents(scope: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
+    query = db.query(TransitIncident)
+    if scope == "control_center":
+        query = query.filter(TransitIncident.transmitted_to_control == True)
+        query = query.filter(TransitIncident.category != "Service Check")
+    elif scope == "supervisor":
+        query = query.filter(TransitIncident.source != "supervisor_app")
+        query = query.filter(TransitIncident.category != "Service Check")
+    
+    rows = query.order_by(TransitIncident.created_at.desc()).limit(limit).all()
     incidents = []
     for inc in rows:
         incidents.append({
@@ -1276,8 +1305,94 @@ def get_incidents(limit: int = 100, db: Session = Depends(get_db)):
             "location_label": inc.location_label,
             "details": inc.details,
             "created_at": inc.created_at,
+            "transmitted_to_control": inc.transmitted_to_control,
+            "source": inc.source,
         })
     return {"incidents": incidents}
+
+class ServiceCheckCreate(BaseModel):
+    vehicle_id: str
+    rating: int
+    checks: dict
+    notes: str | None = None
+    recommend_driver_training: bool = False
+    recommend_vehicle_maintenance: bool = False
+    commend_excellent_service: bool = False
+    source: str = "supervisor_app"
+
+@router.post("/service-checks", status_code=201)
+def create_service_check(payload: ServiceCheckCreate, db: Session = Depends(get_db)):
+    # Find assignment for route_id and driver_name
+    assignment = db.query(DriverAssignment).filter(
+        DriverAssignment.vehicle_id == payload.vehicle_id,
+        DriverAssignment.status == "active"
+    ).first()
+    if not assignment:
+        assignment = db.query(DriverAssignment).filter(
+            DriverAssignment.vehicle_id == payload.vehicle_id,
+            DriverAssignment.status == "scheduled"
+        ).first()
+        
+    route_id = assignment.route_id if assignment else None
+    driver_name = None
+    if assignment:
+        driver = db.query(User).filter(User.user_id == assignment.driver_id).first()
+        driver_name = driver.name if driver else assignment.driver_id
+
+    raw_payload = {
+        "report_type": "service_check",
+        "rating": payload.rating,
+        "checks": payload.checks,
+        "recommend_driver_training": payload.recommend_driver_training,
+        "recommend_vehicle_maintenance": payload.recommend_vehicle_maintenance,
+        "commend_excellent_service": payload.commend_excellent_service,
+    }
+
+    db_incident = TransitIncident(
+        category="Service Check",
+        severity="info",
+        status="new",
+        transmitted_to_control=True,
+        vehicle_id=payload.vehicle_id,
+        route_id=route_id,
+        driver_name=driver_name,
+        details=payload.notes,
+        source=payload.source,
+        raw_payload=raw_payload,
+    )
+    db.add(db_incident)
+    db.commit()
+    db.refresh(db_incident)
+    return {"incident_id": db_incident.incident_id}
+
+@router.get("/service-checks")
+def get_service_checks(limit: int = 100, db: Session = Depends(get_db)):
+    rows = (
+        db.query(TransitIncident)
+        .filter(TransitIncident.category == "Service Check")
+        .order_by(TransitIncident.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    service_checks = []
+    for inc in rows:
+        service_checks.append({
+            "incident_id": inc.incident_id,
+            "category": inc.category,
+            "severity": inc.severity,
+            "status": inc.status,
+            "vehicle_id": inc.vehicle_id,
+            "route_id": inc.route_id,
+            "driver_name": inc.driver_name,
+            "location_label": inc.location_label,
+            "details": inc.details,
+            "created_at": inc.created_at,
+            "transmitted_to_control": inc.transmitted_to_control,
+            "source": inc.source,
+            "raw_payload": inc.raw_payload,
+        })
+    return {"service_checks": service_checks}
+
 from pydantic import BaseModel
 
 class IncidentCreate(BaseModel):
@@ -1309,11 +1424,80 @@ def create_incident(incident: IncidentCreate, db: Session = Depends(get_db)):
         details=incident.details,
         source=incident.source,
         raw_payload=incident.raw_payload,
+        transmitted_to_control=incident.source == "supervisor_app",
     )
     db.add(db_incident)
     db.commit()
     db.refresh(db_incident)
     return {"incident_id": db_incident.incident_id}
+
+
+
+class IncidentActionRequest(BaseModel):
+    status: str | None = None
+    transmitted_to_control: bool | None = None
+    replacement_vehicle_id: str | None = None
+    speed_up: bool | None = None
+
+@router.post("/incidents/{incident_id}/action")
+def update_incident_action(incident_id: str, req: IncidentActionRequest, db: Session = Depends(get_db)):
+    db_incident = db.query(TransitIncident).filter(TransitIncident.incident_id == incident_id).first()
+    if not db_incident:
+        raise HTTPException(status_code=404, detail="Incident not found")
+
+    if req.status is not None:
+        db_incident.status = req.status
+    if req.transmitted_to_control is not None:
+        db_incident.transmitted_to_control = req.transmitted_to_control
+        
+    if req.replacement_vehicle_id:
+        # Find active driver assignment for the incident's broken vehicle
+        db_assign = db.query(DriverAssignment).filter(
+            DriverAssignment.vehicle_id == db_incident.vehicle_id,
+            DriverAssignment.status == "active"
+        ).first()
+        if db_assign:
+            db_assign.vehicle_id = req.replacement_vehicle_id
+            db.commit()
+            
+    if req.speed_up:
+        # Find active assignment for the vehicle
+        db_assign = db.query(DriverAssignment).filter(
+            DriverAssignment.vehicle_id == db_incident.vehicle_id,
+            DriverAssignment.status == "active"
+        ).first()
+        
+        # Get live vehicle state to find current speed
+        state = db.query(VehicleLiveState).filter(VehicleLiveState.vehicle_id == db_incident.vehicle_id).first()
+        current_speed = state.speed if state else 10.0
+        
+        # Update raw_payload of the incident with speed_checkpoint
+        payload = db_incident.raw_payload or {}
+        payload["speed_checkpoint"] = {
+            "reference_speed": current_speed + 2.0,
+            "checked": False,
+            "accelerated": False
+        }
+        db_incident.raw_payload = payload
+        from sqlalchemy.orm.attributes import flag_modified
+        flag_modified(db_incident, "raw_payload")
+        
+        # Send Control Center message to driver
+        if db_assign:
+            driver_msg = ControlMessage(
+                recipient_type="driver",
+                recipient_id=db_assign.driver_id,
+                sender="System",
+                subject="Speed Up Request",
+                body=f"Vehicle {db_incident.vehicle_id} has been reported as delayed. Please speed up to maintain schedule.",
+                priority="high",
+                source="system"
+            )
+            db.add(driver_msg)
+
+    db.commit()
+    db.refresh(db_incident)
+    return {"status": "success", "incident_id": db_incident.incident_id}
 
 
 
@@ -1323,21 +1507,123 @@ class MessageCreate(BaseModel):
     recipient_type: str
     recipient_id: str | None = None
     sender: str | None = "Control Center"
-    subject: str
+    subject: str | None = None
     body: str
     priority: str = "normal"
     source: str = "control_center"
     raw_payload: dict | None = None
 
+
+@router.websocket("/ws/messages")
+async def message_presence_socket(websocket: WebSocket):
+    user_type = (websocket.query_params.get("user_type") or "").lower()
+    user_id = (websocket.query_params.get("user_id") or "").strip()
+    if user_type not in {"driver", "supervisor"} or not user_id:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+    key = (user_type, user_id)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    message_clients[key] = {
+        "user_type": user_type,
+        "user_id": user_id,
+        "connected_at": now,
+        "last_seen": now,
+    }
+    _save_message_last_seen(user_id, now, "active")
+    print(f"MESSAGE_WS_CONNECTED {user_type} {user_id}")
+    try:
+        while True:
+            await websocket.receive_text()
+            if key in message_clients:
+                message_clients[key]["last_seen"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    except WebSocketDisconnect:
+        final_seen = message_clients.pop(key, {}).get(
+            "last_seen", datetime.datetime.now(datetime.timezone.utc).isoformat())
+        _save_message_last_seen(user_id, final_seen, "inactive")
+        print(f"MESSAGE_WS_DISCONNECTED {user_type} {user_id}")
+
+
+@router.get("/control-center/messaging/stats")
+def messaging_stats(db: Session = Depends(get_db)):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    messages = db.query(ControlMessage).all()
+    sent_today = [m for m in messages if m.source == "control_center" and m.created_at.date() == now.date()]
+    broadcasts = [m for m in sent_today if m.recipient_type == "all_drivers" or m.recipient_type.endswith("_drivers")]
+    active_clients = list(message_clients.keys())
+    ws_drivers = {uid for kind, uid in active_clients if kind == "driver"}
+    ws_supervisors = {uid for kind, uid in active_clients if kind == "supervisor"}
+    cutoff = now - datetime.timedelta(seconds=60)
+    http_drivers, http_supervisors = set(), set()
+    for key, last_seen in list(http_presence.items()):
+        if last_seen < cutoff:
+            http_presence.pop(key, None)
+        elif key[0] == "driver":
+            http_drivers.add(key[1])
+        elif key[0] == "supervisor":
+            http_supervisors.add(key[1])
+    drivers = len(ws_drivers | http_drivers)
+    supervisors = len(ws_supervisors | http_supervisors)
+    total = drivers + supervisors
+    print(f"ACTIVE_RECIPIENTS_COUNT {drivers} {supervisors} {total}")
+    return {"messages_sent_today": len(sent_today), "active_recipients": total,
+            "active_drivers": drivers, "active_supervisors": supervisors,
+            "active_driver_ids": [user_id for (kind, user_id) in active_clients if kind == "driver"],
+            "active_supervisor_ids": [user_id for (kind, user_id) in active_clients if kind == "supervisor"],
+            "broadcast_messages_today": len(broadcasts)}
+
 @router.get("/messages")
-def get_messages(limit: int = 20, db: Session = Depends(get_db)):
-    msgs = db.query(ControlMessage).order_by(ControlMessage.created_at.desc()).limit(limit).all()
+def get_messages(
+    recipient_type: str | None = None,
+    recipient_id: str | None = None,
+    sender: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db)
+):
+    if recipient_id:
+        kind = "supervisor" if recipient_id.lower().startswith(("supervisor", "sup_", "sup")) else "driver"
+        seen_at = datetime.datetime.now(datetime.timezone.utc)
+        http_presence[(kind, recipient_id)] = seen_at
+        # Persist real messaging activity for the Users page once this client
+        # is no longer considered currently active.
+        user = db.query(User).filter(User.user_id == recipient_id).first()
+        if user and user.status != "suspended":
+            user.last_active = seen_at.isoformat()
+            db.commit()
+    query = db.query(ControlMessage)
+
+    from sqlalchemy import or_
+    filters = []
+    if recipient_id:
+        recipient = db.query(User).filter(User.user_id == recipient_id).first()
+        if recipient and recipient.status == "suspended":
+            return {"messages": []}
+        # A direct conversation contains only messages sent by this user or
+        # addressed to this user.  Do not fold supervisor broadcasts into this
+        # query: supervisors must not see one another's control-center chats.
+        filters.append(ControlMessage.recipient_id == recipient_id)
+        filters.append(ControlMessage.sender == recipient_id)
+        if "supervisor" not in recipient_id.lower() and "sup" not in recipient_id.lower():
+            filters.append(ControlMessage.recipient_type == "all_drivers")
+            
+    if recipient_type:
+        filters.append(ControlMessage.recipient_type == recipient_type)
+        
+    if sender:
+        filters.append(ControlMessage.sender == sender)
+        
+    if filters:
+        query = query.filter(or_(*filters))
+        
+    msgs = query.order_by(ControlMessage.created_at.desc()).limit(limit).all()
     result = []
     for m in msgs:
         result.append({
             "message_id": m.message_id,
             "recipient_type": m.recipient_type,
             "recipient_id": m.recipient_id,
+            "sender": m.sender,
             "subject": m.subject,
             "body": m.body,
             "priority": m.priority,
@@ -1352,11 +1638,20 @@ def get_messages(limit: int = 20, db: Session = Depends(get_db)):
 
 @router.post("/messages")
 def create_message(msg: MessageCreate, db: Session = Depends(get_db)):
+    # A suspended Driver/Supervisor cannot send or receive control messages.
+    if msg.source in {"driver_app", "supervisor_app"}:
+        sender = db.query(User).filter(User.user_id == msg.sender).first()
+        if sender and sender.status == "suspended":
+            raise HTTPException(403, detail="Suspended users cannot send messages")
+    if msg.recipient_id:
+        recipient = db.query(User).filter(User.user_id == msg.recipient_id).first()
+        if recipient and recipient.status == "suspended":
+            raise HTTPException(403, detail="Cannot send a message to a suspended user")
     db_msg = ControlMessage(
         recipient_type=msg.recipient_type,
         recipient_id=msg.recipient_id,
         sender=msg.sender or "Control Center",
-        subject=msg.subject,
+        subject=msg.subject or "Control Center Chat",
         body=msg.body,
         priority=msg.priority,
         source=msg.source,
@@ -1383,24 +1678,134 @@ def mark_message_read(message_id: str, db: Session = Depends(get_db)):
 def get_cc_drivers(db: Session = Depends(get_db)):
     ensure_defaults(db)
     users = db.query(User).all()
+    active_driver_connection_ids = {
+        user_id for (kind, user_id) in message_clients if kind == "driver"
+    }
+    active_supervisor_ids = {
+        user_id for (kind, user_id) in message_clients if kind == "supervisor"
+    }
+    # Match the existing Active Now metric: WebSocket presence plus a recent
+    # /messages poll from a mobile app.
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=60)
+    active_driver_connection_ids.update(
+        user_id for (kind, user_id), seen in http_presence.items()
+        if kind == "driver" and seen >= cutoff
+    )
+    active_supervisor_ids.update(
+        user_id for (kind, user_id), seen in http_presence.items()
+        if kind == "supervisor" and seen >= cutoff
+    )
+    # Some Driver App builds use the assigned vehicle ID as their messaging
+    # identifier. Resolve that live connection back to its actual driver row.
+    active_driver_ids = set(active_driver_connection_ids)
+    for assignment in db.query(DriverAssignment).filter(
+        DriverAssignment.status.in_(["scheduled", "active"]),
+        DriverAssignment.vehicle_id.in_(active_driver_connection_ids),
+    ).all():
+        active_driver_ids.add(assignment.driver_id)
 
     result = []
     for u in users:
+        active_client = (
+            u.user_id in active_driver_ids or u.user_id in active_supervisor_ids
+        )
         # find current active/scheduled assignment
         assign = db.query(DriverAssignment).filter(
             DriverAssignment.driver_id == u.user_id,
             DriverAssignment.status.in_(["scheduled", "active"])
         ).first()
         assign_label = assign.route_name or assign.route_id if assign else "None"
+        stored_last_active = u.last_active or "Never"
+        if not active_client and stored_last_active not in {"Never", "Unknown"}:
+            try:
+                datetime.datetime.fromisoformat(stored_last_active.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                # Values such as "Now" and "2 min ago" came from old seeded
+                # demo data, not an actual app activity timestamp.
+                stored_last_active = "Never"
         result.append({
             "driver_id": u.user_id,
             "name": u.name,
             "role": u.role,
             "assignment": assign_label,
-            "status": u.status,
-            "last_active": u.last_active
+            # Status in the Control Center user list is live messaging
+            # presence, not the static account status seeded in the database.
+            "status": "active" if active_client else (
+                "suspended" if u.status == "suspended" else "inactive"
+            ),
+            "last_active": "Now" if active_client else stored_last_active
         })
+    # A connected client is real runtime data. If its identifier has not yet
+    # been provisioned in the user directory, expose it instead of silently
+    # losing the active status shown by the messaging counter.
+    known_ids = {entry["driver_id"] for entry in result}
+    for (kind, user_id), client in message_clients.items():
+        if user_id not in known_ids and not (
+            kind == "driver" and user_id in active_driver_connection_ids and
+            any(a.vehicle_id == user_id for a in db.query(DriverAssignment).filter(
+                DriverAssignment.status.in_(["scheduled", "active"])
+            ).all())
+        ):
+            result.append({
+                "driver_id": user_id,
+                "name": user_id,
+                "role": "Driver" if kind == "driver" else "Supervisor",
+                "assignment": "None",
+                "status": "active",
+                "last_active": "Now",
+            })
     return {"users": result}
+
+
+class ControlCenterUserInput(BaseModel):
+    user_id: str
+    name: str
+    role: str
+
+
+class SuspensionUpdate(BaseModel):
+    suspended: bool
+
+
+@router.post("/control-center/users", status_code=201)
+def create_control_center_user(payload: ControlCenterUserInput, db: Session = Depends(get_db)):
+    if payload.role not in {"Driver", "Supervisor", "Operator"}:
+        raise HTTPException(400, detail="Role must be Driver, Supervisor, or Operator")
+    if db.query(User).filter(User.user_id == payload.user_id).first():
+        raise HTTPException(409, detail="User ID already exists")
+    user = User(user_id=payload.user_id, name=payload.name, role=payload.role, status="inactive", last_active="Never")
+    db.add(user)
+    db.commit()
+    return {"user_id": user.user_id}
+
+
+@router.put("/control-center/users/{user_id}")
+def update_control_center_user(user_id: str, payload: ControlCenterUserInput, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(404, detail="User not found")
+    if payload.role not in {"Driver", "Supervisor", "Operator"}:
+        raise HTTPException(400, detail="Role must be Driver, Supervisor, or Operator")
+    user.name, user.role = payload.name, payload.role
+    db.commit()
+    return {"user_id": user.user_id}
+
+
+@router.post("/control-center/users/{user_id}/suspend")
+def suspend_control_center_user(user_id: str, payload: SuspensionUpdate, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        raise HTTPException(404, detail="User not found")
+    user.status = "suspended" if payload.suspended else "active"
+    if payload.suspended:
+        for key in [key for key in message_clients if key[1] == user_id]:
+            message_clients.pop(key, None)
+        for key in [key for key in http_presence if key[1] == user_id]:
+            http_presence.pop(key, None)
+    db.commit()
+    return {"user_id": user.user_id, "status": user.status}
+
+
 
 
 @router.post("/drivers/{driver_id}/assignments", status_code=201)
@@ -1675,7 +2080,12 @@ async def update_assignment(supervisor_id: str, assignment_id: str, request: Req
 
 
 @router.post("/supervisor/{supervisor_id}/assignments/{assignment_id}/cancel")
-def cancel_assignment(supervisor_id: str, assignment_id: str, db: Session = Depends(get_db)):
+async def cancel_assignment(
+    supervisor_id: str,
+    assignment_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
     db_assign = db.query(DriverAssignment).filter(
         DriverAssignment.assignment_id == assignment_id,
         DriverAssignment.supervisor_id == supervisor_id
@@ -1687,10 +2097,45 @@ def cancel_assignment(supervisor_id: str, assignment_id: str, db: Session = Depe
     if db_assign.status in ("completed", "cancelled"):
         raise HTTPException(400, detail="Cannot cancel completed or already cancelled duty")
 
+    body = await request.json()
+    reason = str(body.get("reason") or "Cancelled by supervisor").strip()
+    cancellation_note = f"Cancelled by {supervisor_id}: {reason}"
+    db_assign.notes = "\n".join(
+        note for note in [db_assign.notes, cancellation_note] if note
+    )
     db_assign.status = "cancelled"
     db.commit()
     db.refresh(db_assign)
     return db_assign
+
+
+@router.delete("/supervisor/{supervisor_id}/assignments/{assignment_id}")
+def delete_assignment(
+    supervisor_id: str,
+    assignment_id: str,
+    db: Session = Depends(get_db),
+):
+    """Remove a supervisor-owned duty that is not currently in progress.
+
+    Completed and active duties are operational records, so they cannot be
+    removed through the supervisor app. Cancel an upcoming duty first if it is
+    no longer needed, then delete it from the current assignment list.
+    """
+    db_assign = db.query(DriverAssignment).filter(
+        DriverAssignment.assignment_id == assignment_id,
+        DriverAssignment.supervisor_id == supervisor_id,
+    ).first()
+    if not db_assign:
+        raise HTTPException(404, detail="Assignment not found")
+    if db_assign.status in ("active", "completed"):
+        raise HTTPException(
+            400,
+            detail="Active or completed assignments cannot be deleted",
+        )
+
+    db.delete(db_assign)
+    db.commit()
+    return {"status": "deleted", "assignment_id": assignment_id}
 
 
 # ==========================================

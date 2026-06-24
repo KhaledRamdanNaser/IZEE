@@ -9,7 +9,10 @@ from event_engine.engine import process_event #new
 from event_engine.builder import build_event
 from models.transit_event import TransitEvent
 from models.transit_observation import TransitObservation
-from models.trips_workflow import DriverAssignment
+from models.trips_workflow import DriverAssignment, OperationalRoute
+from models.route import Route
+from models.transit_incident import TransitIncident
+from models.control_message import ControlMessage
 
 from schemas.transit import VehicleLocationRequest
 from utils.validators import (
@@ -246,6 +249,66 @@ def receive_driver_location(raw_payload: dict, db: Session = Depends(get_db)):
     state.driver_id = assignment.driver_id
     state.trip_id = assignment.trip_id
 
+    # Check for delay incidents with speed checkpoint that haven't been verified yet
+    delay_incidents = (
+        db.query(TransitIncident)
+        .filter(
+            TransitIncident.vehicle_id == assignment.vehicle_id,
+            TransitIncident.category.ilike("%delay%"),
+            TransitIncident.status != "resolved"
+        )
+        .all()
+    )
+    for inc in delay_incidents:
+        payload_data = inc.raw_payload or {}
+        checkpoint = payload_data.get("speed_checkpoint")
+        if checkpoint and not checkpoint.get("checked", False):
+            ref_speed = checkpoint.get("reference_speed", 0.0)
+            if payload.speed <= ref_speed:
+                # Driver did not accelerate!
+                inc.transmitted_to_control = True
+                
+                # Append warning to incident details
+                warning_note = f"\n\n[System Alert: Driver was asked to speed up (Ref speed: {ref_speed:.1f} km/h) but has not accelerated. Current speed: {payload.speed:.1f} km/h.]"
+                if warning_note not in (inc.details or ""):
+                    inc.details = (inc.details or "") + warning_note
+                
+                # Send Control Center Message
+                cc_msg = ControlMessage(
+                    recipient_type="control_center",
+                    recipient_id=None,
+                    sender="System",
+                    subject="Vehicle Speed Alert",
+                    body=f"Driver {assignment.driver_id} did not accelerate vehicle {assignment.vehicle_id} after being requested to speed up. Current speed: {payload.speed:.1f} km/h (Reference: {ref_speed:.1f} km/h).",
+                    priority="high",
+                    source="system"
+                )
+                db.add(cc_msg)
+                
+                # Send Supervisor Message
+                if assignment.supervisor_id:
+                    sv_msg = ControlMessage(
+                        recipient_type="supervisor",
+                        recipient_id=assignment.supervisor_id,
+                        sender="System",
+                        subject="Driver Speed Warning",
+                        body=f"Driver {assignment.driver_id} for vehicle {assignment.vehicle_id} did not accelerate after being requested to speed up. Current speed: {payload.speed:.1f} km/h (Reference: {ref_speed:.1f} km/h).",
+                        priority="high",
+                        source="system"
+                    )
+                    db.add(sv_msg)
+                
+                checkpoint["checked"] = True
+                checkpoint["accelerated"] = False
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(inc, "raw_payload")
+            else:
+                # Driver accelerated!
+                checkpoint["checked"] = True
+                checkpoint["accelerated"] = True
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(inc, "raw_payload")
+
     db.commit()
     db.refresh(state)
     db.refresh(db_observation)
@@ -330,6 +393,105 @@ def get_passenger_trip_vehicle_location(trip_id: str, db: Session = Depends(get_
 # simulation_flag = False
 # trust_level = high
 
+import math
+import json
+import urllib.request
+import urllib.error
+import os
+
+OSRM_BASE_URL = os.getenv("OSRM_BASE_URL", "https://router.project-osrm.org")
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    if None in (lat1, lon1, lat2, lon2):
+        return 0.0
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c
+
+def decode_polyline(polyline, precision=5):
+    coordinates = []
+    index = 0
+    lat = 0
+    lon = 0
+    factor = 10 ** precision
+
+    while index < len(polyline):
+        result = 1
+        shift = 0
+        while True:
+            byte = ord(polyline[index]) - 63 - 1
+            index += 1
+            result += byte << shift
+            shift += 5
+            if byte < 0x1F:
+                break
+        lat += ~(result >> 1) if result & 1 else result >> 1
+
+        result = 1
+        shift = 0
+        while True:
+            byte = ord(polyline[index]) - 63 - 1
+            index += 1
+            result += byte << shift
+            shift += 5
+            if byte < 0x1F:
+                break
+        lon += ~(result >> 1) if result & 1 else result >> 1
+        coordinates.append([lat / factor, lon / factor])
+    return coordinates
+
+def get_osrm_driving_geometry(coords):
+    if not OSRM_BASE_URL or len(coords) < 2:
+        return []
+    
+    coord_strs = [f"{lon},{lat}" for lat, lon in coords]
+    geometry_points = []
+    chunk_size = 25
+    
+    for i in range(0, len(coord_strs) - 1, chunk_size - 1):
+        chunk = coord_strs[i:i + chunk_size]
+        if len(chunk) < 2:
+            break
+        
+        url = (
+            f"{OSRM_BASE_URL.rstrip('/')}/route/v1/driving/"
+            f"{';'.join(chunk)}"
+            "?overview=full&geometries=polyline"
+        )
+        
+        request = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "IZEE-Graduation-Project/1.0",
+                "Accept": "application/json",
+            },
+        )
+        
+        try:
+            with urllib.request.urlopen(request, timeout=3.0) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                if payload.get("code") == "Ok" and payload.get("routes"):
+                    route = payload["routes"][0]
+                    geom_str = route.get("geometry")
+                    if geom_str:
+                        decoded = decode_polyline(geom_str)
+                        for lat, lon in decoded:
+                            if not geometry_points or geometry_points[-1] != {"lat": lat, "lon": lon}:
+                                geometry_points.append({"lat": lat, "lon": lon})
+        except Exception as e:
+            print(f"OSRM driving route error: {e}")
+            
+    return geometry_points
+
+def seconds_to_time_str(seconds):
+    h = int(seconds) // 3600
+    m = (int(seconds) % 3600) // 60
+    s = int(seconds) % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
 @router.get("/driver/route-info")
 def get_driver_route_info(
     vehicle_id: str,
@@ -381,6 +543,11 @@ def get_driver_route_info(
             "stale": True,
         }
 
+    # Retrieve current stop sequence from live state, default to 1
+    current_stop_seq = 1
+    if state and state.stop_sequence is not None:
+        current_stop_seq = state.stop_sequence
+
     # Load stops and shape for the route using GTFS data
     trip = None
     if assignment.trip_id:
@@ -393,17 +560,7 @@ def get_driver_route_info(
     stops_list = []
     geometry = []
     if trip:
-        # Load shape points if available
-        from models.shape import Shape
-        shape_points = (
-            db.query(Shape)
-            .filter(Shape.shape_id == trip.shape_id)
-            .order_by(Shape.sequence)
-            .all()
-        )
-        if shape_points:
-            geometry = [{"lat": sp.lat, "lon": sp.lon} for sp in shape_points]
-        # Load stops for origin/destination display
+        # Load stops for display
         from models.stop_time import StopTime
         from models.stop import Stop
         stop_times = (
@@ -412,29 +569,198 @@ def get_driver_route_info(
             .order_by(StopTime.stop_sequence)
             .all()
         )
-        for st in stop_times:
-            stop = db.query(Stop).filter(Stop.stop_id == st.stop_id).first()
-            if stop:
-                stops_list.append({
-                    "stop_id": stop.stop_id,
-                    "name": stop.name,
-                    "lat": stop.lat,
-                    "lon": stop.lon,
-                    "sequence": st.stop_sequence,
+        
+        # Load GTFS schedules from RAPTOR index
+        import routing_integration
+        indexes = routing_integration.get_raptor_indexes()
+        
+        trip_schedule = []
+        if indexes:
+            stop_times_by_trip = indexes.get("stop_times_by_trip", {})
+            trip_schedule = stop_times_by_trip.get(str(trip.trip_id), [])
+            
+        # Synthesize schedule if trip is missing from the index (e.g. custom database trips)
+        if not trip_schedule:
+            start_seconds = 28800  # Default: 08:00:00
+            if assignment.planned_start_time:
+                try:
+                    parts = str(assignment.planned_start_time).split(":")
+                    h = int(parts[0])
+                    m = int(parts[1]) if len(parts) > 1 else 0
+                    s = int(parts[2]) if len(parts) > 2 else 0
+                    start_seconds = h * 3600 + m * 60 + s
+                except Exception:
+                    pass
+            trip_schedule = []
+            for st in stop_times:
+                arrival_time = start_seconds + (st.stop_sequence - 1) * 300
+                trip_schedule.append({
+                    "stop_id": st.stop_id,
+                    "stop_sequence": st.stop_sequence,
+                    "arrival_time": arrival_time,
+                    "departure_time": arrival_time
                 })
-    # Fallback if no shape geometry was found
-    if not geometry:
-        geometry = [{"lat": s["lat"], "lon": s["lon"]} for s in stops_list]
+            
+        schedule_map = {}
+        for st_info in trip_schedule:
+            schedule_map[(st_info["stop_sequence"], str(st_info["stop_id"]))] = st_info
+            
+        # Find next stop's scheduled arrival time
+        next_stop_sched_time = None
+        for st in stop_times:
+            if st.stop_sequence == current_stop_seq:
+                st_info = schedule_map.get((st.stop_sequence, str(st.stop_id)))
+                if st_info:
+                    next_stop_sched_time = st_info["arrival_time"]
+                break
+
+        # Extract stop models efficiently
+        stop_ids = [st.stop_id for st in stop_times]
+        stops_by_id = {s.stop_id: s for s in db.query(Stop).filter(Stop.stop_id.in_(stop_ids)).all()}
+        
+        # Build static cumulative distances for all stops
+        static_distances = {}
+        cumulative_dist = 0.0
+        prev_lat = None
+        prev_lon = None
+        for st in stop_times:
+            stop = stops_by_id.get(st.stop_id)
+            if stop:
+                if prev_lat is not None and prev_lon is not None:
+                    cumulative_dist += haversine_km(prev_lat, prev_lon, stop.lat, stop.lon)
+                static_distances[st.stop_sequence] = cumulative_dist
+                prev_lat = stop.lat
+                prev_lon = stop.lon
+        
+        veh_lat = state.matched_lat if (state and state.matched_lat is not None) else None
+        veh_lon = state.matched_lon if (state and state.matched_lon is not None) else None
+
+        first_stop_sched_time = None
+        if trip_schedule:
+            sorted_sched = sorted(trip_schedule, key=lambda x: x["stop_sequence"])
+            if sorted_sched:
+                first_stop_sched_time = sorted_sched[0]["arrival_time"]
+
+        for st in stop_times:
+            stop = stops_by_id.get(st.stop_id)
+            if not stop:
+                continue
+                
+            seq = st.stop_sequence
+            
+            # Status, Distance & ETA Calculations
+            if seq < current_stop_seq:
+                stop_status = "completed"
+                distance_km = static_distances.get(seq, 0.0)
+                
+                st_info = schedule_map.get((seq, str(stop.stop_id)))
+                if st_info and first_stop_sched_time is not None:
+                    eta_minutes = int(max(0, st_info["arrival_time"] - first_stop_sched_time) // 60)
+                else:
+                    eta_minutes = (seq - 1) * 5
+            elif seq == current_stop_seq:
+                stop_status = "next"
+                if veh_lat is not None and veh_lon is not None:
+                    distance_km = haversine_km(veh_lat, veh_lon, stop.lat, stop.lon)
+                else:
+                    distance_km = static_distances.get(seq, 0.0)
+                eta_minutes = round(max(1.0, distance_km * 2.0))
+            else:
+                stop_status = "upcoming"
+                dist_to_next = 0.0
+                if veh_lat is not None and veh_lon is not None:
+                    next_stop_model = None
+                    for nst in stop_times:
+                        if nst.stop_sequence == current_stop_seq:
+                            next_stop_model = stops_by_id.get(nst.stop_id)
+                            break
+                    if next_stop_model:
+                        dist_to_next = haversine_km(veh_lat, veh_lon, next_stop_model.lat, next_stop_model.lon)
+                    else:
+                        dist_to_next = static_distances.get(current_stop_seq, 0.0)
+                else:
+                    dist_to_next = static_distances.get(current_stop_seq, 0.0)
+                
+                segment_diff = max(0.0, static_distances.get(seq, 0.0) - static_distances.get(current_stop_seq, 0.0))
+                distance_km = dist_to_next + segment_diff
+                
+                st_info = schedule_map.get((seq, str(stop.stop_id)))
+                if st_info and next_stop_sched_time is not None:
+                    sched_diff_sec = max(0, st_info["arrival_time"] - next_stop_sched_time)
+                    if veh_lat is not None and veh_lon is not None:
+                        eta_next_min = max(1.0, dist_to_next * 2.0)
+                        eta_minutes = round(eta_next_min + (sched_diff_sec / 60.0))
+                    else:
+                        eta_minutes = round(5.0 + (sched_diff_sec / 60.0))
+                else:
+                    eta_minutes = round(max(1.0, distance_km * 2.0))
+
+            st_info = schedule_map.get((seq, str(stop.stop_id)))
+            scheduled_time_str = "--"
+            if st_info:
+                scheduled_time_str = seconds_to_time_str(st_info["arrival_time"])
+
+            stops_list.append({
+                "stop_id": stop.stop_id,
+                "name": stop.name,
+                "lat": stop.lat,
+                "lon": stop.lon,
+                "sequence": seq,
+                "status": stop_status,
+                "distance_km": distance_km,
+                "eta_minutes": eta_minutes,
+                "scheduled_time": scheduled_time_str,
+            })
+
+        # Load shape points if available (from cache/db)
+        if trip.shape_id:
+            shape_id_str = str(trip.shape_id)
+            if indexes and "shape_points" in indexes and shape_id_str in indexes["shape_points"]:
+                geometry = [{"lat": pt[0], "lon": pt[1]} for pt in indexes["shape_points"][shape_id_str]]
+            else:
+                from models.shape import Shape
+                shape_points = (
+                    db.query(Shape)
+                    .filter(Shape.shape_id == trip.shape_id)
+                    .order_by(Shape.sequence)
+                    .all()
+                )
+                if shape_points:
+                    geometry = [{"lat": sp.lat, "lon": sp.lon} for sp in shape_points]
+                    
+        # Fallback to OSRM driving profile street geometry if no shape geometry is present
+        if not geometry and stops_list:
+            stop_coords = [(s["lat"], s["lon"]) for s in stops_list]
+            geometry = get_osrm_driving_geometry(stop_coords)
+            
+        # Fallback if both shape points and OSRM fail
+        if not geometry:
+            geometry = [{"lat": s["lat"], "lon": s["lon"]} for s in stops_list]
 
     origin = stops_list[0]["name"] if stops_list else "Origin placeholder"
     destination = stops_list[-1]["name"] if len(stops_list) >= 2 else "Destination placeholder"
 
-    # Minimal route object (can be expanded later)
+    # Calculate route progress and status
+    total_stops = len(stops_list)
+    progress_percent = 0.0
+    if total_stops > 0:
+        if current_stop_seq > total_stops:
+            progress_percent = 100.0
+        else:
+            progress_percent = ((current_stop_seq - 1) / total_stops) * 100.0
+
+    route_status = "completed" if current_stop_seq > total_stops else "active"
+
+    # Route object with actual sequence, status, progress and stops
     route_obj = {
         "route_id": assignment.route_id,
         "route_name": assignment.route_id,
         "origin": origin,
         "destination": destination,
+        "current_stop_sequence": current_stop_seq,
+        "total_stops": total_stops,
+        "progress_percent": progress_percent,
+        "status": route_status,
         "stops": stops_list,
         "geometry": geometry,
     }
@@ -453,21 +779,85 @@ def advance_driver_route_info(
     driver_id: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    response = get_driver_route_info(
+    # Find assignment
+    assignment_query = db.query(DriverAssignment).filter(
+        DriverAssignment.vehicle_id == vehicle_id,
+        DriverAssignment.status.in_([ACTIVE_TRACKING_STATUS, "scheduled"]),
+    )
+    if assignment_id:
+        assignment_query = assignment_query.filter(DriverAssignment.assignment_id == assignment_id)
+    assignment = assignment_query.first()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="No active or scheduled assignment for vehicle")
+
+    # Get or create vehicle live state
+    state = (
+        db.query(VehicleLiveState)
+        .filter(VehicleLiveState.vehicle_id == assignment.vehicle_id)
+        .first()
+    )
+    if not state:
+        state = VehicleLiveState(
+            vehicle_id=assignment.vehicle_id,
+            route_id=assignment.route_id,
+            assignment_id=assignment.assignment_id,
+            driver_id=assignment.driver_id,
+            trip_id=assignment.trip_id,
+        )
+        db.add(state)
+
+    # Get total stops for the trip
+    trip = None
+    if assignment.trip_id:
+        from models.trip import Trip
+        trip = db.query(Trip).filter(Trip.trip_id == assignment.trip_id).first()
+    if not trip:
+        from models.trip import Trip
+        trip = db.query(Trip).filter(Trip.route_id == assignment.route_id).first()
+
+    total_stops = 0
+    if trip:
+        from models.stop_time import StopTime
+        total_stops = db.query(StopTime).filter(StopTime.trip_id == trip.trip_id).count()
+
+    current_seq = state.stop_sequence if state.stop_sequence is not None else 1
+    next_seq = current_seq + 1
+
+    # Persist the new sequence in the database
+    state.stop_sequence = next_seq
+
+    # Set current and next stop IDs if available
+    if trip:
+        from models.stop_time import StopTime
+        stop_times = (
+            db.query(StopTime)
+            .filter(StopTime.trip_id == trip.trip_id)
+            .order_by(StopTime.stop_sequence)
+            .all()
+        )
+        current_stop_id = None
+        next_stop_id = None
+        for st in stop_times:
+            if st.stop_sequence == next_seq:
+                current_stop_id = st.stop_id
+            elif st.stop_sequence == next_seq + 1:
+                next_stop_id = st.stop_id
+        if current_stop_id:
+            state.current_stop_id = current_stop_id
+        if next_stop_id:
+            state.next_stop_id = next_stop_id
+
+    db.commit()
+    db.refresh(state)
+
+    return get_driver_route_info(
         vehicle_id=vehicle_id,
         route_id=route_id,
         assignment_id=assignment_id,
         driver_id=driver_id,
         db=db,
     )
-    route = response.get("route", {})
-    stops = route.get("stops") or []
-    total_stops = len(stops)
-    route["current_stop_sequence"] = min(total_stops, 2) if total_stops else 1
-    route["total_stops"] = total_stops
-    route["progress_percent"] = (1 / total_stops * 100.0) if total_stops else 0.0
-    response["route"] = route
-    return response
+
 
 # Replace temporary simulated defaults when real driver ingestion is introduced.
 # source = driver_app
@@ -717,9 +1107,21 @@ def get_live_vehicles(
     result = []
 
     for v in vehicles:
+        route_name = None
+        if v.route_id:
+            operational_route = db.query(OperationalRoute).filter(
+                OperationalRoute.route_id == v.route_id
+            ).first()
+            gtfs_route = db.query(Route).filter(Route.route_id == v.route_id).first()
+            route_name = (
+                (operational_route.route_long_name or operational_route.route_short_name)
+                if operational_route else None
+            ) or (gtfs_route.route_name if gtfs_route else None) or v.route_id
         result.append({
             "vehicle_id": v.vehicle_id,
             "route_id": v.route_id,
+            "route_name": route_name,
+            "route_label": route_name,
             "timestamp": v.timestamp,
             "last_update": v.timestamp,
             "last_updated": v.timestamp,

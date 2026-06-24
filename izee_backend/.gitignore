@@ -5,8 +5,8 @@ __pycache__/
 izee.db
 data/
 scratch/
+routing/
 invalid_test_responses/
 __pycache__/
 .cache/
-frequency_routing_test_output.json
-test7_response.json
+*.json

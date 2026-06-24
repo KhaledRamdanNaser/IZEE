@@ -1,6 +1,6 @@
 import pandas as pd
 
-gtfs_dir = r"C:\Users\omaro\Documents\IZEE UI\link (7)"
+gtfs_dir = r"C:\Users\omaro\Desktop\semeser 8\link (7)"
 
 print("--- Inspecting GTFS link (7) ---")
 try:

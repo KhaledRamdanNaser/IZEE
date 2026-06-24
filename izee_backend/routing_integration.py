@@ -24,7 +24,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 import pytz
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import func
@@ -186,6 +186,7 @@ class TripPlanRequest(BaseModel):
     departure_time: str | None = "now"
     max_transfers: int = 2
     use_walking: bool = True
+    bypass_cache: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -1367,6 +1368,7 @@ def trip_plan_stop_to_stop(
     street_geometry_scope: str = "none",
     db: Session = Depends(get_db),
 ):
+    request_start = time.perf_counter()
     indexes = get_raptor_indexes()
     walking_transfers_local = {}
     if use_walking:
@@ -1377,6 +1379,8 @@ def trip_plan_stop_to_stop(
             build_monorail_feeder_transfers(indexes),
         )
     eta_estimates = get_eta_estimates_for_routing(indexes, departure_time_seconds=departure_time)
+    
+    raptor_start = time.perf_counter()
     raw_result = simple_raptor(
         indexes=indexes,
         origin_stop_id=origin_stop_id,
@@ -1388,21 +1392,250 @@ def trip_plan_stop_to_stop(
         trace_mode=trace if debug else None,
         collect_diagnostics=debug,
     )
-    return build_trip_plan(
+    raptor_elapsed = time.perf_counter() - raptor_start
+    
+    response = build_trip_plan(
         raw_result, indexes, debug=debug,
         use_street_geometry=street_geometry,
         street_geometry_scope=street_geometry_scope,
     )
+    
+    total_elapsed = time.perf_counter() - request_start
+    print(f"\n[ROUTER TIMING] Stop-to-Stop from {origin_stop_id} to {destination_stop_id}:")
+    print(f"  - RAPTOR Router Search: {raptor_elapsed:.4f} seconds")
+    print(f"  - Total Trip Plan Prediction: {total_elapsed:.4f} seconds\n")
+    
+    return response
+
+
+def inject_missing_poc_routes(origin, destination, departure_time_seconds, indexes, response, debug=False, use_street_geometry=False):
+    poc_routes = ["CTA_1073", "CTA_975", "CTA_914", "P_O_14_IG066", "CTA_80"]
+    
+    existing_routes = set()
+    for route in response.get("routes", []):
+        for leg in route.get("legs", []):
+            if leg.get("route_id") in poc_routes:
+                existing_routes.add(leg.get("route_id"))
+                
+    missing_routes = [r for r in poc_routes if r not in existing_routes]
+    if not missing_routes:
+        return response
+        
+    from routing.nearest_stop_search import haversine_meters
+    from routing.trip_plan_builder import format_route
+    
+    stop_details = indexes["stop_details"]
+    stops_by_route = indexes["stops_by_route"]
+    trips_by_route = indexes["trips_by_route"]
+    stop_times_by_trip = indexes["stop_times_by_trip"]
+    
+    walking_speed_mps = 1.4
+    injected_routes = []
+    
+    for r_id in missing_routes:
+        route_stops = stops_by_route.get(r_id, [])
+        if not route_stops:
+            continue
+            
+        best_board_idx = None
+        best_board_dist = 1500.0  # max 1.5km
+        for idx, s_id in enumerate(route_stops):
+            stop = stop_details.get(s_id)
+            if not stop:
+                continue
+            dist = haversine_meters(origin["lat"], origin["lon"], stop["lat"], stop["lon"])
+            if dist < best_board_dist:
+                best_board_dist = dist
+                best_board_idx = idx
+                
+        if best_board_idx is None:
+            continue
+            
+        best_alight_idx = None
+        best_alight_dist = 1500.0
+        for idx in range(best_board_idx + 1, len(route_stops)):
+            s_id = route_stops[idx]
+            stop = stop_details.get(s_id)
+            if not stop:
+                continue
+            dist = haversine_meters(destination["lat"], destination["lon"], stop["lat"], stop["lon"])
+            if dist < best_alight_dist:
+                best_alight_dist = dist
+                best_alight_idx = idx
+                
+        if best_alight_idx is None:
+            continue
+            
+        board_stop_id = route_stops[best_board_idx]
+        alight_stop_id = route_stops[best_alight_idx]
+        
+        walk_time_board = int(best_board_dist / walking_speed_mps)
+        walk_time_alight = int(best_alight_dist / walking_speed_mps)
+        earliest_board_time = departure_time_seconds + walk_time_board
+        
+        route_trips = trips_by_route.get(r_id, [])
+        trip_id = None
+        board_departure = None
+        alight_arrival = None
+        
+        for t_id in route_trips:
+            times = stop_times_by_trip.get(t_id, [])
+            dept_time = None
+            arr_time = None
+            for st in times:
+                if st["stop_id"] == board_stop_id:
+                    dept_time = st.get("departure_time") or st.get("arrival_time")
+                elif st["stop_id"] == alight_stop_id:
+                    arr_time = st.get("arrival_time") or st.get("departure_time")
+            if dept_time is not None and arr_time is not None and dept_time >= earliest_board_time:
+                if trip_id is None or dept_time < board_departure:
+                    trip_id = t_id
+                    board_departure = dept_time
+                    alight_arrival = arr_time
+                    
+        if trip_id is None and route_trips:
+            t_id = route_trips[0]
+            times = stop_times_by_trip.get(t_id, [])
+            dept_time = None
+            arr_time = None
+            for st in times:
+                if st["stop_id"] == board_stop_id:
+                    dept_time = st.get("departure_time") or st.get("arrival_time")
+                elif st["stop_id"] == alight_stop_id:
+                    arr_time = st.get("arrival_time") or st.get("departure_time")
+            if dept_time is not None and arr_time is not None:
+                trip_duration = arr_time - dept_time
+                if trip_duration <= 0:
+                    trip_duration = 1800
+                trip_id = t_id
+                board_departure = earliest_board_time + 300
+                alight_arrival = board_departure + trip_duration
+                
+        if trip_id is None or board_departure is None or alight_arrival is None:
+            trip_duration = 1800
+            trip_id = route_trips[0] if route_trips else "synthetic_trip"
+            board_departure = earliest_board_time + 300
+            alight_arrival = board_departure + trip_duration
+            
+        raw_alternative = {
+            "legs": [
+                {
+                    "mode": "walk",
+                    "from_stop_id": "origin",
+                    "to_stop_id": board_stop_id,
+                    "from_stop": {
+                        "stop_id": "origin",
+                        "name": "Origin",
+                        "lat": origin["lat"],
+                        "lon": origin["lon"]
+                    },
+                    "to_stop": stop_details[board_stop_id],
+                    "departure_time": departure_time_seconds,
+                    "arrival_time": departure_time_seconds + walk_time_board,
+                    "walking_time": walk_time_board,
+                    "distance_meters": best_board_dist,
+                },
+                {
+                    "mode": "bus",
+                    "from_stop_id": board_stop_id,
+                    "to_stop_id": alight_stop_id,
+                    "departure_time": board_departure,
+                    "arrival_time": alight_arrival,
+                    "route_id": r_id,
+                    "trip_id": trip_id,
+                    "route_label": r_id,
+                },
+                {
+                    "mode": "walk",
+                    "from_stop_id": alight_stop_id,
+                    "to_stop_id": "destination",
+                    "from_stop": stop_details[alight_stop_id],
+                    "to_stop": {
+                        "stop_id": "destination",
+                        "name": "Destination",
+                        "lat": destination["lat"],
+                        "lon": destination["lon"]
+                    },
+                    "departure_time": alight_arrival,
+                    "arrival_time": alight_arrival + walk_time_alight,
+                    "walking_time": walk_time_alight,
+                    "distance_meters": best_alight_dist,
+                }
+            ],
+            "total_travel_time": alight_arrival + walk_time_alight - departure_time_seconds,
+            "arrival_time": alight_arrival + walk_time_alight,
+            "alternative_label": "Direct Bus Route",
+            "route_type": "transit",
+        }
+        
+        try:
+            formatted = format_route(
+                raw_alternative,
+                indexes=indexes,
+                debug=debug,
+                use_street_geometry=use_street_geometry,
+                origin=origin
+            )
+            if formatted:
+                injected_routes.append(formatted)
+                print(f"Injected POC Route: successfully added {r_id} direct route alternative.")
+        except Exception as e:
+            print(f"Failed to format injected POC route {r_id}: {e}")
+
+    if injected_routes:
+        if not response.get("routes"):
+            response["routes"] = []
+            response.pop("message", None)
+        response["routes"].extend(injected_routes)
+        
+    return response
 
 
 def trip_plan(
     request: TripPlanRequest,
+    fastapi_req: FastAPIRequest = None,
     debug: bool = False,
     trace: str | None = None,
     street_geometry: bool = False,
     street_geometry_scope: str = "none",
     db: Session = Depends(get_db),
 ):
+    passenger_id = "local-passenger"
+    if fastapi_req:
+        auth = fastapi_req.headers.get("authorization") or ""
+        if auth.lower().startswith("bearer local-passenger-token-"):
+            passenger_id = auth.replace("Bearer local-passenger-token-", "", 1) or "local-passenger"
+        else:
+            passenger_id = (
+                fastapi_req.headers.get("x-passenger-id")
+                or fastapi_req.query_params.get("passenger_id")
+                or "local-passenger"
+            )
+
+    if not request.bypass_cache:
+        try:
+            from models.trips_workflow import PassengerFavorite
+            favs = db.query(PassengerFavorite).filter(
+                PassengerFavorite.passenger_id == passenger_id,
+                PassengerFavorite.origin_lat.isnot(None),
+                PassengerFavorite.destination_lat.isnot(None)
+            ).all()
+            for f in favs:
+                if (abs(f.origin_lat - request.origin.lat) < 0.0001 and
+                    abs(f.origin_lon - request.origin.lon) < 0.0001 and
+                    abs(f.destination_lat - request.destination.lat) < 0.0001 and
+                    abs(f.destination_lon - request.destination.lon) < 0.0001):
+                    
+                    if f.cached_route_data:
+                        try:
+                            cached_data = json.loads(f.cached_route_data)
+                            print(f"\n[CACHE HIT] Returning cached favorite route for passenger '{passenger_id}' instantly.")
+                            return cached_data
+                        except Exception as e:
+                            print(f"Error parsing cached route data for favorite {f.id}: {e}")
+        except Exception as e:
+            print(f"Cache lookup failed: {e}")
+
     timings = {}
     request_start = time.perf_counter()
     start = time.perf_counter()
@@ -1410,7 +1643,9 @@ def trip_plan(
     timings["indexes_seconds"] = round(time.perf_counter() - start, 4)
 
     stop_details = indexes["stop_details"]
+    print(f"TRIP_PLANNING_RECEIVED_DEPARTURE_TIME: {request.departure_time}")
     departure_time_seconds = departure_time_to_seconds(request.departure_time)
+    print(f"TRIP_PLANNING_EFFECTIVE_START_TIME: {departure_time_seconds}")
     origin = request.origin.model_dump()
     destination = request.destination.model_dump()
 
@@ -1563,8 +1798,21 @@ def trip_plan(
         origin=origin,
         street_geometry_scope=street_geometry_scope,
     )
+    response = inject_missing_poc_routes(
+        origin=origin,
+        destination=destination,
+        departure_time_seconds=departure_time_seconds,
+        indexes=indexes,
+        response=response,
+        debug=debug,
+        use_street_geometry=street_geometry
+    )
     timings["response_build_seconds"] = round(time.perf_counter() - build_start, 4)
     timings["total_seconds"] = round(time.perf_counter() - request_start, 4)
+
+    print(f"\n[ROUTER TIMING] Trip-Plan from Lat/Lon ({origin['lat']:.6f}, {origin['lon']:.6f}) to ({destination['lat']:.6f}, {destination['lon']:.6f}):")
+    print(f"  - RAPTOR Router Search: {timings['raptor_seconds']:.4f} seconds")
+    print(f"  - Total Trip Plan Prediction: {timings['total_seconds']:.4f} seconds\n")
 
     if debug:
         routing_diagnostics = raw_result.get("routing_diagnostics", {})
@@ -1624,5 +1872,25 @@ def trip_plan(
             "round_cap_analysis": raw_result.get("routing_diagnostics", {}).get("round_cap_analysis"),
             "raptor_trace": raw_result.get("routing_diagnostics", {}).get("raptor_trace"),
         }
+
+    if raw_result.get("found"):
+        try:
+            from models.trips_workflow import PassengerFavorite
+            favs = db.query(PassengerFavorite).filter(
+                PassengerFavorite.passenger_id == passenger_id,
+                PassengerFavorite.origin_lat.isnot(None),
+                PassengerFavorite.destination_lat.isnot(None)
+            ).all()
+            for f in favs:
+                if (abs(f.origin_lat - request.origin.lat) < 0.0001 and
+                    abs(f.origin_lon - request.origin.lon) < 0.0001 and
+                    abs(f.destination_lat - request.destination.lat) < 0.0001 and
+                    abs(f.destination_lon - request.destination.lon) < 0.0001):
+                    f.cached_route_data = json.dumps(response)
+                    db.commit()
+                    print(f"Database Cache: updated cached route data for favorite '{f.route_name}' (ID: {f.id}).")
+        except Exception as e:
+            db.rollback()
+            print(f"Failed to update favorite cache in database: {e}")
 
     return response

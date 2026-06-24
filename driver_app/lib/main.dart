@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'live_map_screen.dart';
 import 'package:latlong2/latlong.dart' hide Path;
 
 import 'services/driver_services.dart';
@@ -18,6 +17,7 @@ const bg = Color(0xFFF7F9FB);
 const danger = Color(0xFFF20A18);
 const orange = Color(0xFFE56800);
 const purple = Color(0xFF9B00F5);
+const rose = Color(0xFFF43F5E);
 
 class IzeeDriverApp extends StatefulWidget {
   const IzeeDriverApp({super.key});
@@ -744,7 +744,7 @@ class TripStatusCard extends StatelessWidget {
                 return Row(
                   children: [
                     Expanded(
-                        child: InfoPair(label: 'Route', value: state.routeId)),
+                        child: InfoPair(label: 'Route', value: state.active && state.routeId.isNotEmpty ? state.routeId : 'no routes active')),
                     Expanded(
                         child: InfoPair(
                             label: 'Vehicle ID', value: state.vehicleId)),
@@ -791,8 +791,10 @@ class TripStatusCard extends StatelessWidget {
                             }
                           } catch (error) {
                             if (!context.mounted) return;
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              SnackBar(content: Text(error.toString())),
+                            showAppPopup(
+                              context,
+                              message: error.toString().replaceFirst('Exception: ', ''),
+                              isSuccess: false,
                             );
                           }
                         },
@@ -938,7 +940,7 @@ class NextStopCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'No Active Trip',
+                        'no routes active',
                         style: TextStyle(
                             fontSize: 16,
                             fontWeight: FontWeight.w800,
@@ -1985,13 +1987,12 @@ class _RouteInformationScreenState extends State<RouteInformationScreen> {
 
     try {
       await widget.services.advanceRouteStop();
-      // If route is now complete, navigate to the summary screen.
       if (!mounted) return;
       final routeData = widget.services.routeState.value;
       if (routeData != null) {
         final updated = DriverRouteInfo.fromApi(routeData);
         if (updated.isComplete) {
-          Navigator.push(
+          Navigator.pushReplacement(
             context,
             MaterialPageRoute(
               builder: (_) => TripSummaryScreen(
@@ -2004,9 +2005,10 @@ class _RouteInformationScreenState extends State<RouteInformationScreen> {
       }
     } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text(error.toString().replaceFirst('Exception: ', ''))),
+      showAppPopup(
+        context,
+        message: error.toString().replaceFirst('Exception: ', ''),
+        isSuccess: false,
       );
     } finally {
       if (mounted) setState(() => _advancing = false);
@@ -2077,30 +2079,60 @@ class _RouteInformationScreenState extends State<RouteInformationScreen> {
                       separatorBuilder: (_, __) => const SizedBox(height: 10),
                       itemBuilder: (context, index) {
                         if (index == stops.length) {
-                          return ElevatedButton.icon(
-                            onPressed: route?.isComplete == true || _advancing
-                                ? null
-                                : _advanceStop,
-                            style: ElevatedButton.styleFrom(
-                              backgroundColor: green,
-                              foregroundColor: Colors.white,
-                              minimumSize: const Size.fromHeight(48),
-                              shape: RoundedRectangleBorder(
-                                  borderRadius: BorderRadius.circular(8)),
-                            ),
-                            icon: _advancing
-                                ? const SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(
-                                      strokeWidth: 2,
-                                      color: Colors.white,
-                                    ),
-                                  )
-                                : const Icon(Icons.check_circle_outline),
-                            label: Text(route?.isComplete == true
-                                ? 'Route Completed'
-                                : 'Mark Next Stop Completed'),
+                          final activeRoute = route!;
+                          return Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              ElevatedButton.icon(
+                                onPressed: activeRoute.status == 'completed'
+                                    ? null
+                                    : () {
+                                        Navigator.push(
+                                          context,
+                                          MaterialPageRoute(
+                                            builder: (_) => DriverNavigationScreen(
+                                              services: widget.services,
+                                            ),
+                                          ),
+                                        );
+                                      },
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: green,
+                                  foregroundColor: Colors.white,
+                                  minimumSize: const Size.fromHeight(48),
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(8)),
+                                ),
+                                icon: const Icon(Icons.navigation_outlined),
+                                label: const Text('Start Navigation'),
+                              ),
+                              const SizedBox(height: 10),
+                              OutlinedButton.icon(
+                                onPressed: activeRoute.status == 'completed' || _advancing
+                                    ? null
+                                    : _advanceStop,
+                                style: OutlinedButton.styleFrom(
+                                  foregroundColor: green,
+                                  side: const BorderSide(color: green),
+                                  minimumSize: const Size.fromHeight(48),
+                                  shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(8)),
+                                ),
+                                icon: _advancing
+                                    ? const SizedBox(
+                                        width: 18,
+                                        height: 18,
+                                        child: CircularProgressIndicator(
+                                          strokeWidth: 2,
+                                          color: green,
+                                        ),
+                                      )
+                                    : const Icon(Icons.check_circle_outline),
+                                label: Text(activeRoute.status == 'completed'
+                                    ? 'Route Completed'
+                                    : 'Mark Next Stop Completed'),
+                              ),
+                            ],
                           );
                         }
 
@@ -2114,6 +2146,601 @@ class _RouteInformationScreenState extends State<RouteInformationScreen> {
                 ),
               ),
             ],
+          );
+        },
+      ),
+    );
+  }
+}
+
+class DriverNavigationScreen extends StatefulWidget {
+  const DriverNavigationScreen({super.key, required this.services});
+
+  final DriverServices services;
+
+  @override
+  State<DriverNavigationScreen> createState() => _DriverNavigationScreenState();
+}
+
+class _DriverNavigationScreenState extends State<DriverNavigationScreen> {
+  final MapController _mapController = MapController();
+  bool _loading = false;
+  bool _advancing = false;
+  bool _followUser = true;
+  bool _showStopsList = false;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.services.routeState.value == null) {
+      _loadRoute();
+    }
+  }
+
+  Future<void> _loadRoute() async {
+    setState(() {
+      _loading = true;
+    });
+    try {
+      await widget.services.loadRouteInfo();
+    } catch (e) {
+      debugPrint('Error loading route: $e');
+    } finally {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _advanceStop() async {
+    if (_advancing) return;
+    setState(() => _advancing = true);
+
+    try {
+      await widget.services.advanceRouteStop();
+      // If route is now complete, navigate to the summary screen.
+      if (!mounted) return;
+      final routeData = widget.services.routeState.value;
+      if (routeData != null) {
+        final updated = DriverRouteInfo.fromApi(routeData);
+        if (updated.isComplete) {
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (_) => TripSummaryScreen(
+                services: widget.services,
+                routeInfo: updated,
+              ),
+            ),
+          );
+        }
+      }
+    } catch (error) {
+      if (!mounted) return;
+      showAppPopup(
+        context,
+        message: error.toString().replaceFirst('Exception: ', ''),
+        isSuccess: false,
+      );
+    } finally {
+      if (mounted) setState(() => _advancing = false);
+    }
+  }
+
+  Widget _buildStopMarker(DriverStop stop) {
+    Color borderCol;
+    Color bgCol;
+    double size;
+    Widget? childWidget;
+
+    if (stop.completed) {
+      borderCol = Colors.grey;
+      bgCol = Colors.grey.shade300;
+      size = 12.0;
+      childWidget = const Icon(Icons.check, size: 8, color: Colors.grey);
+    } else if (stop.current) {
+      borderCol = Colors.orange.shade700;
+      bgCol = Colors.orange.shade100;
+      size = 18.0;
+      childWidget = Container(
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: Colors.orange.shade700,
+        ),
+        margin: const EdgeInsets.all(3),
+      );
+    } else {
+      borderCol = Colors.blue.shade700;
+      bgCol = Colors.white;
+      size = 14.0;
+    }
+
+    return Container(
+      width: size,
+      height: size,
+      decoration: BoxDecoration(
+        shape: BoxShape.circle,
+        color: bgCol,
+        border: Border.all(color: borderCol, width: 2),
+      ),
+      child: childWidget,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: ValueListenableBuilder<Map<String, dynamic>?>(
+        valueListenable: widget.services.routeState,
+        builder: (context, routeData, _) {
+          return ValueListenableBuilder<DriverTripState>(
+            valueListenable: widget.services.tripState,
+            builder: (context, tripState, _) {
+              final route = routeData != null ? DriverRouteInfo.fromApi(routeData) : null;
+              final stops = route?.stops ?? const <DriverStop>[];
+              final position = tripState.lastPosition;
+              final userLocation = position != null ? LatLng(position.latitude, position.longitude) : null;
+              final userHeading = position?.heading;
+
+              if (_loading && routeData == null) {
+                return const Center(
+                  child: CircularProgressIndicator(color: green),
+                );
+              }
+
+              if (route == null || stops.isEmpty) {
+                return Stack(
+                  children: [
+                    Positioned(
+                      top: MediaQuery.of(context).padding.top + 10,
+                      left: 16,
+                      child: FloatingActionButton.small(
+                        heroTag: 'exit_route_info_empty',
+                        backgroundColor: Colors.white,
+                        foregroundColor: ink,
+                        onPressed: () => Navigator.pop(context),
+                        child: const Icon(Icons.close),
+                      ),
+                    ),
+                    const Center(
+                      child: Text(
+                        'no routes active',
+                        style: TextStyle(
+                          color: muted,
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              }
+
+              final activeRoute = route;
+
+              // Determine current instruction and next stop
+              String currentInstruction = 'Route Completed';
+              String nextStopName = 'Destination';
+              String distanceStr = '--';
+              String nextStopDuration = '--';
+              DriverStop? currentStop;
+
+              try {
+                currentStop = stops.firstWhere((s) => s.current);
+              } catch (_) {
+                try {
+                  currentStop = stops.firstWhere((s) => !s.completed);
+                } catch (_) {}
+              }
+
+              if (currentStop != null) {
+                currentInstruction = 'Proceed to ${currentStop.name}';
+                nextStopName = currentStop.name;
+                distanceStr = currentStop.distance;
+                nextStopDuration = '${currentStop.etaMinutes} min';
+              }
+
+              final boardingStop = stops.first;
+              final destinationStop = stops.length >= 2 ? stops.last : null;
+
+              // Build stop markers
+              final markers = <Marker>[];
+              if (userLocation != null) {
+                markers.add(
+                  Marker(
+                    point: userLocation,
+                    width: 48,
+                    height: 48,
+                    child: _UserLocationMarker(heading: userHeading),
+                  ),
+                );
+              }
+              for (final stop in stops) {
+                if (stop.hasCoordinates) {
+                  final pt = LatLng(stop.lat, stop.lon);
+                  if (stop == boardingStop) {
+                    markers.add(
+                      Marker(
+                        point: pt,
+                        width: 36,
+                        height: 36,
+                        child: const _MapPin(icon: Icons.navigation, bg: green, color: Colors.white),
+                      ),
+                    );
+                  } else if (stop == destinationStop) {
+                    markers.add(
+                      Marker(
+                        point: pt,
+                        width: 36,
+                        height: 36,
+                        child: const _MapPin(icon: Icons.location_on, bg: rose, color: Colors.white),
+                      ),
+                    );
+                  } else {
+                    markers.add(
+                      Marker(
+                        point: pt,
+                        width: 24,
+                        height: 24,
+                        child: Center(child: _buildStopMarker(stop)),
+                      ),
+                    );
+                  }
+                }
+              }
+
+              final center = userLocation ?? (stops.isNotEmpty ? LatLng(stops.first.lat, stops.first.lon) : const LatLng(0, 0));
+
+              if (_followUser && userLocation != null) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  _mapController.move(userLocation, _mapController.camera.zoom);
+                });
+              }
+
+              return Stack(
+                children: [
+                  // 1. FlutterMap background
+                  Positioned.fill(
+                    child: FlutterMap(
+                      mapController: _mapController,
+                      options: MapOptions(
+                        initialCenter: center,
+                        initialZoom: 15,
+                        interactionOptions: const InteractionOptions(
+                          flags: InteractiveFlag.all,
+                        ),
+                        onPositionChanged: (pos, hasGesture) {
+                          if (hasGesture) {
+                            setState(() {
+                              _followUser = false;
+                            });
+                          }
+                        },
+                      ),
+                      children: [
+                        TileLayer(
+                          urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                          userAgentPackageName: 'com.izee.driver',
+                        ),
+                        if (activeRoute.geometry.isNotEmpty)
+                          PolylineLayer(
+                            polylines: [
+                              Polyline(
+                                points: activeRoute.geometry,
+                                color: green,
+                                strokeWidth: 6,
+                              ),
+                            ],
+                          ),
+                        MarkerLayer(markers: markers),
+                      ],
+                    ),
+                  ),
+
+                  // 2. Floating Back Button
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 10,
+                    left: 16,
+                    child: FloatingActionButton.small(
+                      heroTag: 'exit_route_info',
+                      backgroundColor: Colors.white,
+                      foregroundColor: ink,
+                      onPressed: () => Navigator.pop(context),
+                      child: const Icon(Icons.close),
+                    ),
+                  ),
+
+                  // 3. Floating Re-Center Button
+                  Positioned(
+                    bottom: 300,
+                    right: 16,
+                    child: FloatingActionButton.small(
+                      heroTag: 'recenter_driver_nav',
+                      backgroundColor: _followUser ? green : Colors.white,
+                      foregroundColor: _followUser ? Colors.white : green,
+                      onPressed: () {
+                        setState(() {
+                          _followUser = true;
+                        });
+                        if (userLocation != null) {
+                          _mapController.move(userLocation, 16.0);
+                        }
+                      },
+                      child: const Icon(Icons.my_location),
+                    ),
+                  ),
+
+                  // 4. Top Route Info Card
+                  Positioned(
+                    top: MediaQuery.of(context).padding.top + 10,
+                    left: 70,
+                    right: 16,
+                    child: Card(
+                      elevation: 4,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      color: Colors.white,
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Text(
+                                    activeRoute.routeName,
+                                    style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 15, color: ink),
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Row(
+                                    children: [
+                                      Text(
+                                        'Stop ${activeRoute.currentStopSequence} of ${activeRoute.totalStops}',
+                                        style: const TextStyle(fontWeight: FontWeight.w700, color: green, fontSize: 13),
+                                      ),
+                                      const SizedBox(width: 8),
+                                      const Icon(Icons.fiber_manual_record, size: 6, color: muted),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        '${(activeRoute.progressPercent).toStringAsFixed(0)}% completed',
+                                        style: const TextStyle(color: muted, fontSize: 13),
+                                      ),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            ),
+                            const Icon(Icons.directions_bus, color: green, size: 28),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // 5. Bottom Navigation Control Card
+                  Positioned(
+                    bottom: MediaQuery.of(context).padding.bottom + 16,
+                    left: 16,
+                    right: 16,
+                    child: Card(
+                      elevation: 6,
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                      color: Colors.white,
+                      child: Padding(
+                        padding: const EdgeInsets.all(18),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            // Current Instruction
+                            Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(8),
+                                  decoration: BoxDecoration(
+                                    shape: BoxShape.circle,
+                                    color: green.withOpacity(0.12),
+                                  ),
+                                  child: const Icon(
+                                    Icons.navigation,
+                                    color: green,
+                                    size: 24,
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        'CURRENT INSTRUCTION',
+                                        style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        currentInstruction,
+                                        style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 18, color: ink),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const Divider(height: 24),
+
+                            // Next stop details
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      const Text(
+                                        'NEXT STOP',
+                                        style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        nextStopName,
+                                        style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 15, color: ink),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    const Text(
+                                      'DISTANCE',
+                                      style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      distanceStr,
+                                      style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: green),
+                                    ),
+                                  ],
+                                ),
+                                const SizedBox(width: 18),
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.end,
+                                  children: [
+                                    const Text(
+                                      'ETA',
+                                      style: TextStyle(color: muted, fontSize: 10, fontWeight: FontWeight.w800, letterSpacing: 0.6),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      nextStopDuration,
+                                      style: const TextStyle(fontWeight: FontWeight.w900, fontSize: 16, color: green),
+                                    ),
+                                  ],
+                                ),
+                              ],
+                            ),
+                            const Divider(height: 24),
+
+                            // Collapsible Stops List
+                            InkWell(
+                              onTap: () {
+                                setState(() {
+                                  _showStopsList = !_showStopsList;
+                                });
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 4),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Text(
+                                      _showStopsList ? 'Hide Stops List' : 'Show Stops List',
+                                      style: const TextStyle(fontWeight: FontWeight.w700, color: green, fontSize: 13),
+                                    ),
+                                    Icon(
+                                      _showStopsList ? Icons.keyboard_arrow_up : Icons.keyboard_arrow_down,
+                                      color: green,
+                                      size: 20,
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            ),
+                            if (_showStopsList) ...[
+                              const SizedBox(height: 8),
+                              Container(
+                                constraints: const BoxConstraints(maxHeight: 150),
+                                child: ListView.builder(
+                                  shrinkWrap: true,
+                                  physics: const ClampingScrollPhysics(),
+                                  padding: EdgeInsets.zero,
+                                  itemCount: stops.length,
+                                  itemBuilder: (context, idx) {
+                                    final stop = stops[idx];
+                                    return Padding(
+                                      padding: const EdgeInsets.symmetric(vertical: 6.0),
+                                      child: Row(
+                                        children: [
+                                          Icon(
+                                            stop.completed ? Icons.check_circle : stop.current ? Icons.radio_button_checked : Icons.radio_button_off,
+                                            color: stop.completed || stop.current ? green : muted,
+                                            size: 18,
+                                          ),
+                                          const SizedBox(width: 8),
+                                          Expanded(
+                                            child: Text(
+                                              stop.name,
+                                              style: TextStyle(
+                                                color: stop.completed ? Colors.grey : ink,
+                                                fontWeight: stop.current ? FontWeight.bold : FontWeight.normal,
+                                                fontSize: 13,
+                                              ),
+                                            ),
+                                          ),
+                                          Text(
+                                            stop.time,
+                                            style: const TextStyle(color: muted, fontSize: 11),
+                                          ),
+                                        ],
+                                      ),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
+                            const SizedBox(height: 14),
+
+                            // Action button
+                            ElevatedButton(
+                              onPressed: activeRoute.status == 'completed' || _advancing
+                                  ? null
+                                  : _advanceStop,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: green,
+                                foregroundColor: Colors.white,
+                                minimumSize: const Size.fromHeight(48),
+                                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                              ),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.center,
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  _advancing
+                                      ? const SizedBox(
+                                          width: 18,
+                                          height: 18,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: Colors.white,
+                                          ),
+                                        )
+                                      : const Icon(Icons.check_circle_outline),
+                                  const SizedBox(width: 8),
+                                  Flexible(
+                                    child: Text(
+                                      activeRoute.status == 'completed'
+                                          ? 'Route Completed'
+                                          : 'Mark Next Stop Completed',
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              );
+            },
           );
         },
       ),
@@ -2220,12 +2847,19 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
   double _totalDistanceKm() {
     double total = 0;
     for (final stop in widget.routeInfo.stops) {
-      final km = double.tryParse(
-              stop.distance.replaceAll(RegExp(r'[^\d.]'), '')) ??
-          0;
-      if (km > total) total = km;
+      if (stop.distanceKm > total) total = stop.distanceKm;
     }
     return total;
+  }
+
+  int _totalDurationMinutes() {
+    int maxDuration = 0;
+    for (final stop in widget.routeInfo.stops) {
+      if (stop.etaMinutes > maxDuration) {
+        maxDuration = stop.etaMinutes;
+      }
+    }
+    return maxDuration;
   }
 
   Future<void> _endTrip(BuildContext ctx) async {
@@ -2238,8 +2872,10 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
       Navigator.of(ctx).popUntil((route) => route.isFirst);
     } catch (e) {
       if (!ctx.mounted) return;
-      ScaffoldMessenger.of(ctx).showSnackBar(
-        SnackBar(content: Text(e.toString())),
+      showAppPopup(
+        ctx,
+        message: e.toString().replaceFirst('Exception: ', ''),
+        isSuccess: false,
       );
       setState(() => _ending = false);
     }
@@ -2255,6 +2891,9 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
         allDone ? routeInfo.stops.length : routeInfo.stops.where((s) => s.completed).length;
     final totalKm = _totalDistanceKm();
     final elapsedLabel = _elapsedLabel();
+    final durationLabel = elapsedLabel == '0m' || elapsedLabel == '--'
+        ? '${_totalDurationMinutes()} mins'
+        : elapsedLabel;
 
     return Scaffold(
       body: Column(
@@ -2310,6 +2949,15 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
                     style: TextStyle(
                         color: Colors.white.withOpacity(0.8), fontSize: 13),
                   ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Distance: ${totalKm > 0 ? "${totalKm.toStringAsFixed(1)} km" : "--"}   •   Duration: $durationLabel',
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 14,
+                        fontWeight: FontWeight.bold),
+                  ),
                 ],
               ),
             ),
@@ -2343,7 +2991,7 @@ class _TripSummaryScreenState extends State<TripSummaryScreen>
                       icon: Icons.timer_outlined,
                       iconColor: const Color(0xFFF59E0B),
                       label: 'Duration',
-                      value: elapsedLabel,
+                      value: durationLabel,
                     ),
                   ],
                 ),
@@ -2589,16 +3237,17 @@ class _SummaryStopRow extends StatelessWidget {
                       const Icon(Icons.access_time, size: 13, color: muted),
                       const SizedBox(width: 4),
                       Text(stop.time,
-                          style:
-                              const TextStyle(color: muted, fontSize: 12)),
-                      if (stop.distance != '0 km') ...[
-                        const SizedBox(width: 10),
-                        const Icon(Icons.straighten, size: 13, color: muted),
-                        const SizedBox(width: 4),
-                        Text(stop.distance,
-                            style: const TextStyle(
-                                color: muted, fontSize: 12)),
-                      ],
+                          style: const TextStyle(color: muted, fontSize: 12)),
+                      const SizedBox(width: 10),
+                      const Icon(Icons.straighten, size: 13, color: muted),
+                      const SizedBox(width: 4),
+                      Text(stop.distance,
+                          style: const TextStyle(color: muted, fontSize: 12)),
+                      const SizedBox(width: 10),
+                      const Icon(Icons.timer_outlined, size: 13, color: muted),
+                      const SizedBox(width: 4),
+                      Text('${stop.etaMinutes} mins',
+                          style: const TextStyle(color: muted, fontSize: 12)),
                     ],
                   ),
                 ],
@@ -2667,7 +3316,7 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> {
 
   bool get _isCritical => _criticalCategories.contains(selected);
 
-  String get _recipient => _isCritical ? 'Control Center' : 'Supervisor';
+  String get _recipient => 'Supervisor';
 
   Color get _sendColor =>
       _isCritical ? const Color(0xFFDC2626) : const Color(0xFFF59E0B);
@@ -2695,11 +3344,10 @@ class _ReportIssueScreenState extends State<ReportIssueScreen> {
       if (!mounted) return;
       final incident = response['incident'] as Map<String, dynamic>?;
       final incidentId = incident?['incident_id']?.toString() ?? 'submitted';
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Report sent to $_recipient: $incidentId'),
-          backgroundColor: _isCritical ? const Color(0xFFDC2626) : null,
-        ),
+      showAppPopup(
+        context,
+        message: 'Report sent to $_recipient: $incidentId',
+        isSuccess: true,
       );
       Navigator.pop(context);
     } catch (error) {
@@ -3106,15 +3754,26 @@ class CardShell extends StatelessWidget {
 }
 
 class GreenTopBar extends StatelessWidget {
-  const GreenTopBar({super.key, required this.title, required this.onBack});
+  const GreenTopBar({
+    super.key,
+    required this.title,
+    required this.onBack,
+    this.actions,
+  });
 
   final String title;
   final VoidCallback onBack;
+  final List<Widget>? actions;
 
   @override
   Widget build(BuildContext context) {
     return ColoredTopBar(
-        title: title, onBack: onBack, color: darkGreen, height: 76);
+      title: title,
+      onBack: onBack,
+      color: darkGreen,
+      height: 76,
+      actions: actions,
+    );
   }
 }
 
@@ -3180,12 +3839,14 @@ class ColoredTopBar extends StatelessWidget {
     required this.onBack,
     required this.color,
     this.height = 56,
+    this.actions,
   });
 
   final String title;
   final VoidCallback onBack;
   final Color color;
   final double height;
+  final List<Widget>? actions;
 
   @override
   Widget build(BuildContext context) {
@@ -3212,7 +3873,10 @@ class ColoredTopBar extends StatelessWidget {
                   ),
                 ),
               ),
-              const SizedBox(width: 48),
+              if (actions != null)
+                ...actions!
+              else
+                const SizedBox(width: 48),
             ],
           ),
         ),
@@ -3595,9 +4259,9 @@ class GreenRouteHeader extends StatelessWidget {
     final currentStop = route?.currentStopSequence ?? 0;
     final totalStops = route?.totalStops ?? 0;
     final progress = route?.progressPercent ?? 0;
-    final routeName = route?.routeName ?? 'Loading route...';
+    final routeName = route?.routeName ?? 'no routes active';
     final routeDirection = route == null
-        ? 'Fetching assigned stops'
+        ? 'no routes active'
         : '${route!.origin} -> ${route!.destination}';
 
     return Container(
@@ -3701,11 +4365,23 @@ class DriverStop {
     required this.etaMinutes,
     required this.lat,
     required this.lon,
+    required this.distanceKm,
   });
 
   factory DriverStop.fromApi(Map<String, dynamic> json) {
     final status = json['status']?.toString().toLowerCase() ?? 'upcoming';
     final distanceKm = _asDouble(json['distance_km']);
+    final etaVal = json['eta_minutes'];
+
+    String formattedDistance;
+    if (distanceKm <= 0) {
+      formattedDistance = '0 m';
+    } else if (distanceKm < 1.0) {
+      formattedDistance = '${(distanceKm * 1000).toStringAsFixed(0)} m';
+    } else {
+      formattedDistance = '${distanceKm.toStringAsFixed(1)} km';
+    }
+
     return DriverStop(
       name: json['name']?.toString() ?? 'Unnamed stop',
       time: json['scheduled_time']?.toString() ?? '--',
@@ -3716,13 +4392,11 @@ class DriverStop {
               : '',
       completed: status == 'completed',
       current: status == 'next',
-      distance:
-          distanceKm <= 0 ? '0 km' : '${distanceKm.toStringAsFixed(1)} km',
-      etaMinutes: status == 'next'
-          ? 5
-          : (((_asInt(json['sequence']) - 1).clamp(1, 12)) * 5).toInt(),
+      distance: formattedDistance,
+      etaMinutes: etaVal != null ? _asInt(etaVal) : (status == 'next' ? 5 : 0),
       lat: _asDouble(json['lat']),
       lon: _asDouble(json['lon']),
+      distanceKm: distanceKm,
     );
   }
 
@@ -3735,6 +4409,7 @@ class DriverStop {
   final int etaMinutes;
   final double lat;
   final double lon;
+  final double distanceKm;
 
   bool get hasCoordinates => lat != 0 && lon != 0;
 }
@@ -3990,14 +4665,6 @@ class IncidentTile extends StatelessWidget {
             Text(title,
                 textAlign: TextAlign.center,
                 style: const TextStyle(fontWeight: FontWeight.w800)),
-            if (isCritical && !selected) ...[
-              const SizedBox(height: 4),
-              const Text('→ Control Center',
-                  style: TextStyle(
-                      fontSize: 10,
-                      color: Color(0xFFDC2626),
-                      fontWeight: FontWeight.w700)),
-            ],
             if (selected) ...[
               const SizedBox(height: 8),
               CircleAvatar(
@@ -4183,6 +4850,85 @@ String _messageTimeLabel(String? value) {
   return '${local.year}-${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')}';
 }
 
+void showAppPopup(
+  BuildContext context, {
+  required String message,
+  required bool isSuccess,
+  String? title,
+}) {
+  showDialog(
+    context: context,
+    builder: (context) {
+      final primaryColor = isSuccess ? green : danger;
+      final icon = isSuccess ? Icons.check_circle_outline : Icons.error_outline;
+      final defaultTitle = title ?? (isSuccess ? 'Success' : 'Error');
+
+      return Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        elevation: 12,
+        backgroundColor: Colors.white,
+        child: Padding(
+          padding: const EdgeInsets.all(24.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircleAvatar(
+                radius: 28,
+                backgroundColor: primaryColor.withOpacity(0.12),
+                child: Icon(icon, color: primaryColor, size: 36),
+              ),
+              const SizedBox(height: 18),
+              Text(
+                defaultTitle,
+                style: const TextStyle(
+                  color: ink,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w900,
+                  fontFamily: 'Roboto',
+                ),
+              ),
+              const SizedBox(height: 10),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  color: muted,
+                  fontSize: 14,
+                  height: 1.4,
+                  fontFamily: 'Roboto',
+                ),
+              ),
+              const SizedBox(height: 22),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(context),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: primaryColor,
+                    foregroundColor: Colors.white,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    padding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
+                  child: const Text(
+                    'OK',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w900,
+                      fontSize: 15,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
+}
+
 const fallbackMessages = [
   MessageData(
     'Control Center',
@@ -4316,7 +5062,7 @@ class _MyTripsScreenState extends State<MyTripsScreen> {
                         const Icon(Icons.route_outlined,
                             color: muted, size: 48),
                         const SizedBox(height: 12),
-                        const Text('No duties assigned for today.',
+                        const Text('no routes assigned',
                             style: TextStyle(color: muted)),
                         const SizedBox(height: 16),
                         ElevatedButton(
@@ -4538,7 +5284,6 @@ class _MyTripsScreenState extends State<MyTripsScreen> {
                                   if (statusStr == 'scheduled')
                                     ElevatedButton(
                                       onPressed: () async {
-                                        final messenger = ScaffoldMessenger.of(context);
                                         try {
                                           debugPrint(
                                               'SELECTED_ASSIGNMENT: $duty');
@@ -4548,8 +5293,10 @@ class _MyTripsScreenState extends State<MyTripsScreen> {
                                             tripId: tripId,
                                             vehicleId: vehicleId,
                                           );
-                                          messenger.showSnackBar(
-                                            SnackBar(content: Text('Started assignment for $routeName')),
+                                          showAppPopup(
+                                            context,
+                                            message: 'Started assignment for $routeName',
+                                            isSuccess: true,
                                           );
                                           if (context.mounted) {
                                             Navigator.pushReplacement(
@@ -4562,8 +5309,10 @@ class _MyTripsScreenState extends State<MyTripsScreen> {
                                             );
                                           }
                                         } catch (e) {
-                                          messenger.showSnackBar(
-                                            SnackBar(content: Text('Failed to start trip: $e')),
+                                          showAppPopup(
+                                            context,
+                                            message: 'Failed to start trip: ${e.toString().replaceFirst('Exception: ', '')}',
+                                            isSuccess: false,
                                           );
                                         }
                                       },
@@ -4588,7 +5337,6 @@ class _MyTripsScreenState extends State<MyTripsScreen> {
                                   else if (statusStr == 'active' || isCurrentlyActiveTrip)
                                     ElevatedButton(
                                       onPressed: () async {
-                                        final messenger = ScaffoldMessenger.of(context);
                                         try {
                                           debugPrint(
                                               'SELECTED_ASSIGNMENT: $duty');
@@ -4609,8 +5357,10 @@ class _MyTripsScreenState extends State<MyTripsScreen> {
                                             );
                                           }
                                         } catch (e) {
-                                          messenger.showSnackBar(
-                                            SnackBar(content: Text('Failed to continue trip: $e')),
+                                          showAppPopup(
+                                            context,
+                                            message: 'Failed to continue trip: ${e.toString().replaceFirst('Exception: ', '')}',
+                                            isSuccess: false,
                                           );
                                         }
                                       },
@@ -4690,6 +5440,51 @@ class _TripHistoryScreenState extends State<TripHistoryScreen> {
     setState(() {
       _historyFuture = widget.services.loadTripHistory();
     });
+  }
+
+  Future<void> _clearHistory() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear Trip History'),
+        content: const Text('Are you sure you want to permanently clear all trip history? This action cannot be undone.'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            style: TextButton.styleFrom(foregroundColor: danger),
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Clear All'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && mounted) {
+      try {
+        await widget.services.clearTripHistory();
+        _refresh();
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Trip history cleared successfully'),
+              backgroundColor: darkGreen,
+            ),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Failed to clear trip history: $e'),
+              backgroundColor: danger,
+            ),
+          );
+        }
+      }
+    }
   }
 
   Widget _buildStatusBadge(String status) {
@@ -4868,6 +5663,13 @@ class _TripHistoryScreenState extends State<TripHistoryScreen> {
           GreenTopBar(
             title: 'Trip History',
             onBack: () => Navigator.pop(context),
+            actions: [
+              IconButton(
+                icon: const Icon(Icons.delete_sweep, color: Colors.white),
+                tooltip: 'Clear History',
+                onPressed: _clearHistory,
+              ),
+            ],
           ),
           // Filter Bar
           Container(
@@ -5041,10 +5843,14 @@ class _TripHistoryScreenState extends State<TripHistoryScreen> {
                           Row(
                             mainAxisAlignment: MainAxisAlignment.spaceBetween,
                             children: [
-                              Text(
-                                'Trip ID: $tripId',
-                                style: const TextStyle(color: muted, fontSize: 13),
+                              Expanded(
+                                child: Text(
+                                  'Trip ID: $tripId',
+                                  style: const TextStyle(color: muted, fontSize: 13),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
                               ),
+                              const SizedBox(width: 8),
                               if (serviceDate.isNotEmpty)
                                 Text(
                                   'Date: $serviceDate',
@@ -5315,7 +6121,6 @@ class _DriverSettingsScreenState extends State<DriverSettingsScreen> {
                           width: double.infinity,
                           child: ElevatedButton.icon(
                             onPressed: () async {
-                              final scaffoldMessenger = ScaffoldMessenger.of(context);
                               try {
                                 await services.logout();
                                 if (context.mounted) {
@@ -5325,8 +6130,10 @@ class _DriverSettingsScreenState extends State<DriverSettingsScreen> {
                                   );
                                 }
                               } catch (e) {
-                                scaffoldMessenger.showSnackBar(
-                                  SnackBar(content: Text('Failed to logout: $e')),
+                                showAppPopup(
+                                  context,
+                                  message: 'Failed to logout: ${e.toString().replaceFirst('Exception: ', '')}',
+                                  isSuccess: false,
                                 );
                               }
                             },
@@ -5436,6 +6243,118 @@ class _DriverSettingsScreenState extends State<DriverSettingsScreen> {
           icon: const Icon(Icons.arrow_drop_down, color: muted),
           dropdownColor: Colors.white,
           style: const TextStyle(fontSize: 14, color: ink, fontFamily: 'Roboto'),
+        ),
+      ],
+    );
+  }
+}
+
+class _UserLocationMarker extends StatelessWidget {
+  const _UserLocationMarker({super.key, this.heading});
+  final double? heading;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Container(
+          width: 36,
+          height: 36,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.blue.withOpacity(0.15),
+          ),
+        ),
+        Container(
+          width: 18,
+          height: 18,
+          decoration: const BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.white,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.black26,
+                blurRadius: 4,
+                offset: Offset(0, 2),
+              ),
+            ],
+          ),
+        ),
+        Container(
+          width: 12,
+          height: 12,
+          decoration: const BoxDecoration(
+            shape: BoxShape.circle,
+            color: Colors.blue,
+          ),
+        ),
+        if (heading != null)
+          Transform.rotate(
+            angle: (heading! * 3.141592653589793) / 180,
+            child: CustomPaint(
+              size: const Size(36, 36),
+              painter: _DirectionConePainter(),
+            ),
+          ),
+      ],
+    );
+  }
+}
+
+class _DirectionConePainter extends CustomPainter {
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..shader = RadialGradient(
+        colors: [
+          Colors.blue.withOpacity(0.4),
+          Colors.blue.withOpacity(0.0),
+        ],
+      ).createShader(Rect.fromCircle(
+          center: Offset(size.width / 2, size.height / 2),
+          radius: size.width / 2))
+      ..style = PaintingStyle.fill;
+
+    final path = Path()
+      ..moveTo(size.width / 2, size.height / 2)
+      ..arcTo(
+        Rect.fromCircle(
+            center: Offset(size.width / 2, size.height / 2),
+            radius: size.width / 2),
+        -3.141592653589793 / 2 - 3.141592653589793 / 6,
+        3.141592653589793 / 3,
+        false,
+      )
+      ..close();
+
+    canvas.drawPath(path, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => false;
+}
+
+class _MapPin extends StatelessWidget {
+  const _MapPin({
+    required this.icon,
+    required this.bg,
+    required this.color,
+  });
+
+  final IconData icon;
+  final Color bg;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Icon(Icons.location_on, color: bg, size: 36),
+        Positioned(
+          top: 4,
+          child: Icon(icon, color: color, size: 16),
         ),
       ],
     );

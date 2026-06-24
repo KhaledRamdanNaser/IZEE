@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'package:latlong2/latlong.dart';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:geolocator/geolocator.dart';
@@ -28,7 +28,7 @@ class DriverTripState {
       : active = false,
         sending = false,
         vehicleId = 'driver_test_001',
-        routeId = 'A-12 Express',
+        routeId = '',
         lastPosition = null,
         lastSentAt = null,
         lastError = null,
@@ -132,160 +132,51 @@ class DriverServices {
 
   Timer? _locationTimer;
   Timer? _messageRefreshTimer;
+  WebSocket? _messageSocket;
+  Timer? _messageSocketPingTimer;
   bool _sendingTick = false;
+  String _driverId = defaultDriverId;
   String _vehicleId = defaultVehicleId;
   String _activeRouteId = defaultRouteId;
+  bool _mockHistoryCleared = false;
 
-  static const mockRoutes = {
-  'A-12 Express': {
-    'route_id': 'A-12 Express',
-    'route_name': 'A-12 Express',
-    'origin': 'Downtown Terminal',
-    'destination': 'Cairo Stadium',
-    'current_stop_sequence': 1,
-    'total_stops': 5,
-    'progress_percent': 0.0,
-    'status': 'active',
-    'stops': [
-      {
-        'name': 'Downtown Terminal',
-        'scheduled_time': '08:15 AM',
-        'status': 'next',
-        'distance_km': 0.0,
-        'sequence': 1,
-      },
-      {
-        'name': 'Ramses Square Stop',
-        'scheduled_time': '08:25 AM',
-        'status': 'upcoming',
-        'distance_km': 3.5,
-        'sequence': 2,
-      },
-      {
-        'name': 'Abbaseya Station',
-        'scheduled_time': '08:35 AM',
-        'status': 'upcoming',
-        'distance_km': 6.2,
-        'sequence': 3,
-      },
-      {
-        'name': 'Cairo Stadium Station',
-        'scheduled_time': '08:45 AM',
-        'status': 'upcoming',
-        'distance_km': 8.5,
-        'sequence': 4,
-      },
-      {
-        'name': 'Al Manara Center Terminal',
-        'scheduled_time': '08:55 AM',
-        'status': 'upcoming',
-        'distance_km': 11.0,
-        'sequence': 5,
-      },
-    ],
-    'geometry': [
-      [30.0, 31.0],
-      [30.1, 31.1],
-      [30.2, 31.2],
-      [30.3, 31.3],
-    ],
-  },
-  'B-20 Local': {
-    'route_id': 'B-20 Local',
-    'route_name': 'B-20 Local',
-    'origin': 'Giza Square',
-    'destination': 'Heliopolis Gate',
-    'current_stop_sequence': 1,
-    'total_stops': 4,
-    'progress_percent': 0.0,
-    'status': 'active',
-    'stops': [
-      {
-        'name': 'Giza Square Terminal',
-        'scheduled_time': '11:00 AM',
-        'status': 'next',
-        'distance_km': 0.0,
-        'sequence': 1,
-      },
-      {
-        'name': 'Cairo University Station',
-        'scheduled_time': '11:15 AM',
-        'status': 'upcoming',
-        'distance_km': 2.1,
-        'sequence': 2,
-      },
-      {
-        'name': 'Tahrir Square Hub',
-        'scheduled_time': '11:35 AM',
-        'status': 'upcoming',
-        'distance_km': 5.8,
-        'sequence': 3,
-      },
-      {
-        'name': 'Heliopolis Gate Terminal',
-        'scheduled_time': '12:10 PM',
-        'status': 'upcoming',
-        'distance_km': 14.5,
-        'sequence': 4,
-      },
-    ],
-    // No geometry for B-20 Local (optional)
-  },
-  'C-05 Shuttle': {
-    'route_id': 'C-05 Shuttle',
-    'route_name': 'C-05 Shuttle',
-    'origin': 'Maadi Ring Road',
-    'destination': 'New Cairo Hub',
-    'current_stop_sequence': 1,
-    'total_stops': 3,
-    'progress_percent': 0.0,
-    'status': 'active',
-    'stops': [
-      {
-        'name': 'Maadi Ring Road Terminal',
-        'scheduled_time': '02:00 PM',
-        'status': 'next',
-        'distance_km': 0.0,
-        'sequence': 1,
-      },
-      {
-        'name': 'Police Academy Stop',
-        'scheduled_time': '02:20 PM',
-        'status': 'upcoming',
-        'distance_km': 9.5,
-        'sequence': 2,
-      },
-      {
-        'name': 'New Cairo Hub Terminal',
-        'scheduled_time': '02:45 PM',
-        'status': 'upcoming',
-        'distance_km': 16.2,
-        'sequence': 3,
-      },
-    ],
-    'geometry': [
-      [30.5, 31.5],
-      [30.6, 31.55],
-      [30.7, 31.6],
-    ],
-  },
-};
+  static const mockRoutes = <String, Map<String, dynamic>>{};
+  static const defaultDriverId = 'driver_test_001';
 
   Future<Map<String, dynamic>> login({
     required String driverId,
     required String password,
   }) async {
     final normalizedDriverId = driverId.trim();
-    _vehicleId =
-        normalizedDriverId.isEmpty ? defaultVehicleId : normalizedDriverId;
+    _driverId = normalizedDriverId.isEmpty ? defaultDriverId : normalizedDriverId;
     tripState.value = tripState.value.copyWith(
+      driverId: _driverId,
       vehicleId: _vehicleId,
       clearError: true,
     );
+    // Presence is optional infrastructure. Never make a socket handshake block
+    // a successful Driver App login.
+    unawaited(_connectMessageSocket(
+        _driverId));
     return {
       'status': 'local_login',
-      'vehicle_id': _vehicleId,
+      'driver_id': _driverId,
     };
+  }
+
+  Future<void> _connectMessageSocket(String driverId) async {
+    try {
+      await _messageSocket?.close();
+      _messageSocketPingTimer?.cancel();
+      final wsBase = ApiConfig.baseUrl.replaceFirst(RegExp(r'^http'), 'ws');
+      _messageSocket = await WebSocket.connect(
+              '$wsBase/ws/messages?user_type=driver&user_id=${Uri.encodeQueryComponent(driverId)}')
+          .timeout(const Duration(seconds: 5));
+      _messageSocketPingTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
+        if (_messageSocket == null) return timer.cancel();
+        _messageSocket!.add('ping');
+      });
+    } catch (_) {}
   }
 
   Future<void> startTrip() async {
@@ -356,7 +247,7 @@ class DriverServices {
   Future<Map<String, dynamic>> submitIncidentReport({
     required String category,
     required String details,
-    String recipient = 'Control Center',
+    String recipient = 'Supervisor',
   }) async {
     await _ensureLocationReady();
     final position = await Geolocator.getCurrentPosition(
@@ -457,7 +348,7 @@ class DriverServices {
 
   Future<List<Map<String, dynamic>>> loadMessages() async {
     try {
-      final response = await api.getMessages(recipientId: _vehicleId);
+      final response = await api.getMessages(recipientId: _driverId);
       final messages = response['messages'];
       if (messages is List) {
         final list = messages.whereType<Map<String, dynamic>>().map((m) {
@@ -515,9 +406,9 @@ class DriverServices {
 
   Future<List<Map<String, dynamic>>> loadAssignedDuties() async {
     try {
-      debugPrint('AUTH_DRIVER_ID: $_vehicleId');
-      debugPrint('MY_TRIPS_REQUEST: driver_id=$_vehicleId');
-      final response = await api.getDriverAssignments(driverId: _vehicleId);
+      debugPrint('AUTH_DRIVER_ID: $_driverId');
+      debugPrint('MY_TRIPS_REQUEST: driver_id=$_driverId');
+      final response = await api.getDriverAssignments(driverId: _driverId);
       debugPrint('MY_TRIPS_RESPONSE: $response');
       final list = response['assigned_trips'] ?? response['assignments'];
       if (list is List) {
@@ -528,50 +419,7 @@ class DriverServices {
       debugPrint('IZEE Driver API: Failed to connect to live backend assignments API, using local mock repository fallback. Error: $e');
     }
 
-    return [
-      {
-        'assignment_id': 'mock_assignment_1',
-        'driver_id': _vehicleId,
-        'vehicle_id': 'bus_001',
-        'route_id': 'A-12 Express',
-        'route_name': 'A-12 Express',
-        'trip_id': 'T-9871',
-        'origin': 'Downtown Terminal',
-        'destination': 'Cairo Stadium',
-        'start_time': '08:15 AM',
-        'end_time': '08:55 AM',
-        'service_date': DateTime.now().toIso8601String().split('T')[0],
-        'status': 'scheduled',
-      },
-      {
-        'assignment_id': 'mock_assignment_2',
-        'driver_id': _vehicleId,
-        'vehicle_id': 'bus_002',
-        'route_id': 'B-20 Local',
-        'route_name': 'B-20 Local',
-        'trip_id': 'T-9872',
-        'origin': 'Giza Square',
-        'destination': 'Heliopolis Gate',
-        'start_time': '11:00 AM',
-        'end_time': '12:10 PM',
-        'service_date': DateTime.now().toIso8601String().split('T')[0],
-        'status': 'scheduled',
-      },
-      {
-        'assignment_id': 'mock_assignment_3',
-        'driver_id': _vehicleId,
-        'vehicle_id': 'bus_003',
-        'route_id': 'C-05 Shuttle',
-        'route_name': 'C-05 Shuttle',
-        'trip_id': 'T-9873',
-        'origin': 'Maadi Ring Road',
-        'destination': 'New Cairo Hub',
-        'start_time': '02:00 PM',
-        'end_time': '02:45 PM',
-        'service_date': DateTime.now().toIso8601String().split('T')[0],
-        'status': 'scheduled',
-      },
-    ];
+    return const [];
   }
 
   Future<void> startAssignment({
@@ -584,9 +432,9 @@ class DriverServices {
     try {
       if (!assignmentId.startsWith('mock_')) {
         debugPrint(
-            'START_TRIP_REQUEST: assignment_id=$assignmentId driver_id=$_vehicleId');
+            'START_TRIP_REQUEST: assignment_id=$assignmentId driver_id=$_driverId');
         final response =
-            await api.startAssignment(assignmentId: assignmentId, driverId: _vehicleId);
+            await api.startAssignment(assignmentId: assignmentId, driverId: _driverId);
         debugPrint('START_TRIP_RESPONSE: $response');
         final assignment = response['assignment'];
         if (assignment is Map<String, dynamic>) {
@@ -616,7 +464,7 @@ class DriverServices {
     final selectedVehicleId = startedAssignment?['vehicle_id']?.toString() ?? (assignmentId.startsWith('mock_') ? null : vehicleId) ?? _vehicleId;
     final selectedTripId = startedAssignment?['trip_id']?.toString() ?? tripId;
     final selectedDriverId =
-        startedAssignment?['driver_id']?.toString() ?? _vehicleId;
+        startedAssignment?['driver_id']?.toString() ?? _driverId;
     final selectedRegionId = startedAssignment?['region_id']?.toString();
 
     _activeRouteId = selectedRouteId;
@@ -680,9 +528,19 @@ class DriverServices {
     );
   }
 
+  Future<void> clearTripHistory() async {
+    _mockHistoryCleared = true;
+    if (_driverId.isNotEmpty && !_driverId.startsWith('mock_')) {
+      await api.clearDriverTripHistory(driverId: _driverId);
+    }
+  }
+
   Future<List<Map<String, dynamic>>> loadTripHistory() async {
+    if (_mockHistoryCleared) {
+      return const <Map<String, dynamic>>[];
+    }
     try {
-      final response = await api.getDriverTripHistory(driverId: _vehicleId);
+      final response = await api.getDriverTripHistory(driverId: _driverId);
       final history = response['history'];
       if (history is List) {
         debugPrint('IZEE Driver API: Loaded trip history from live backend API');
@@ -764,12 +622,7 @@ class DriverServices {
         return;
       }
     } catch (_) {
-      final mockRoute = mockRoutes[newRouteId];
-      if (mockRoute != null) {
-        routeState.value = Map<String, dynamic>.from(mockRoute);
-      } else {
-        routeState.value = null;
-      }
+      routeState.value = null;
     }
   }
 
@@ -803,15 +656,11 @@ class DriverServices {
         routeState.value = null;
         rethrow;
       }
-      if (routeState.value == null) {
-        final mockRoute =
-            mockRoutes[_activeRouteId] ?? mockRoutes['A-12 Express']!;
-        routeState.value = Map<String, dynamic>.from(mockRoute);
-      }
     }
-    return routeState.value ??
-        mockRoutes[_activeRouteId] ??
-        mockRoutes['A-12 Express']!;
+    if (routeState.value == null) {
+      throw Exception('no routes active');
+    }
+    return routeState.value!;
   }
 
   Future<Map<String, dynamic>> advanceRouteStop() async {
@@ -840,57 +689,14 @@ class DriverServices {
         );
         return route;
       }
-    } catch (_) {
-      final current = routeState.value ??
-          Map<String, dynamic>.from(
-              mockRoutes[_activeRouteId] ?? mockRoutes['A-12 Express']!);
-      
-      final seqVal = current['current_stop_sequence'];
-      final currentSeq = seqVal is int
-          ? seqVal
-          : seqVal is num
-              ? seqVal.toInt()
-              : double.tryParse(seqVal?.toString() ?? '')?.toInt() ?? 1;
-
-      final stops = List<Map<String, dynamic>>.from(
-        (current['stops'] as List? ?? [])
-            .map((s) => Map<String, dynamic>.from(s as Map)),
-      );
-      final total = stops.length;
-
-      if (currentSeq < total) {
-        final nextSeq = currentSeq + 1;
-        for (var i = 0; i < total; i++) {
-          final stopSeq = i + 1;
-          if (stopSeq < nextSeq) {
-            stops[i]['status'] = 'completed';
-          } else if (stopSeq == nextSeq) {
-            stops[i]['status'] = 'next';
-          } else {
-            stops[i]['status'] = 'upcoming';
-          }
-        }
-        final progress = (nextSeq - 1) / total * 100.0;
-        final updated = Map<String, dynamic>.from(current)
-          ..['current_stop_sequence'] = nextSeq
-          ..['progress_percent'] = progress
-          ..['stops'] = stops;
-        routeState.value = updated;
-      } else if (currentSeq == total) {
-        for (var i = 0; i < total; i++) {
-          stops[i]['status'] = 'completed';
-        }
-        final updated = Map<String, dynamic>.from(current)
-          ..['current_stop_sequence'] = total
-          ..['progress_percent'] = 100.0
-          ..['status'] = 'completed'
-          ..['stops'] = stops;
-        routeState.value = updated;
-      }
+    } catch (e) {
+      debugPrint('advanceRouteStop error: $e');
+      rethrow;
     }
-    return routeState.value ??
-        mockRoutes[_activeRouteId] ??
-        mockRoutes['A-12 Express']!;
+    if (routeState.value == null) {
+      throw Exception('no routes active');
+    }
+    return routeState.value!;
   }
 
   Future<void> flushQueuedLocations() async {
@@ -910,6 +716,7 @@ class DriverServices {
   Future<void> logout() async {
     await endTrip();
     api.clearAuthToken();
+    _driverId = defaultDriverId;
     _vehicleId = defaultVehicleId;
     tripState.value = tripState.value.copyWith(
       vehicleId: _vehicleId,
@@ -981,7 +788,7 @@ class DriverServices {
     return {
       'assignment_id': state.assignmentId,
       'trip_id': state.tripId,
-      'driver_id': state.driverId ?? _vehicleId,
+      'driver_id': state.driverId ?? _driverId,
       'vehicle_id': state.vehicleId,
       'route_id': state.routeId,
       'lat': position.latitude,
@@ -1103,6 +910,8 @@ class DriverServices {
   void dispose() {
     _locationTimer?.cancel();
     _messageRefreshTimer?.cancel();
+    _messageSocket?.close();
+    _messageSocketPingTimer?.cancel();
     tripState.dispose();
     routeState.dispose();
     unreadCount.dispose();

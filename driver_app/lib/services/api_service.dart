@@ -127,6 +127,12 @@ class ApiService {
     return get('/driver/$driverId/trip-history');
   }
 
+  Future<Map<String, dynamic>> clearDriverTripHistory({
+    required String driverId,
+  }) {
+    return post('/driver/$driverId/trip-history/clear');
+  }
+
   Future<Map<String, dynamic>> getDriverAssignments({
     required String driverId,
   }) {

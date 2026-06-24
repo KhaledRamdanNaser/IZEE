@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Integer
+from sqlalchemy import Column, String, Boolean, DateTime, ForeignKey, Integer, Float
 from database.connection import Base
 import datetime
 
@@ -110,6 +110,13 @@ class PassengerFavorite(Base):
     route_id = Column(String, nullable=False)
     route_name = Column(String, nullable=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    origin_lat = Column(Float, nullable=True)
+    origin_lon = Column(Float, nullable=True)
+    destination_lat = Column(Float, nullable=True)
+    destination_lon = Column(Float, nullable=True)
+    origin_name = Column(String, nullable=True)
+    destination_name = Column(String, nullable=True)
+    cached_route_data = Column(String, nullable=True)
 
 
 class PassengerTripHistory(Base):
@@ -120,5 +127,40 @@ class PassengerTripHistory(Base):
     route_id = Column(String, nullable=False)
     route_name = Column(String, nullable=True)
     timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class PassengerWallet(Base):
+    __tablename__ = "passenger_wallets"
+
+    passenger_id = Column(String, primary_key=True)
+    balance = Column(Float, default=250.0)
+    currency = Column(String, default="EGP")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class PassengerPaymentMethod(Base):
+    __tablename__ = "passenger_payment_methods"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    passenger_id = Column(String, nullable=False, index=True)
+    card_holder = Column(String, nullable=False)
+    card_number = Column(String, nullable=False)
+    card_type = Column(String, nullable=False)
+    expiry = Column(String, nullable=False)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class PassengerTransaction(Base):
+    __tablename__ = "passenger_transactions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    passenger_id = Column(String, nullable=False, index=True)
+    title = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    transaction_type = Column(String, nullable=False)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
 
 

@@ -129,8 +129,48 @@ class AppServices {
     return api.getProfile();
   }
 
-  Future<Map<String, dynamic>> topUpWallet() {
-    return api.post('${ApiConfig.wallet}/top-up', body: {'amount': 100});
+  Future<List<Map<String, dynamic>>> loadFavorites() async {
+    try {
+      final res = await api.getFavorites();
+      final data = res['data'];
+      if (data is List) {
+        return data.whereType<Map<String, dynamic>>().toList();
+      }
+      return const [];
+    } catch (e) {
+      print('Error loading favorites: $e');
+      return const [];
+    }
+  }
+
+  Future<Map<String, dynamic>> addFavorite({
+    required String routeId,
+    required String routeName,
+    required double originLat,
+    required double originLon,
+    required double destinationLat,
+    required double destinationLon,
+    required String originName,
+    required String destinationName,
+  }) {
+    return api.addFavorite({
+      'route_id': routeId,
+      'route_name': routeName,
+      'origin_lat': originLat,
+      'origin_lon': originLon,
+      'destination_lat': destinationLat,
+      'destination_lon': destinationLon,
+      'origin_name': originName,
+      'destination_name': destinationName,
+    });
+  }
+
+  Future<Map<String, dynamic>> deleteFavorite(String routeId) {
+    return api.deleteFavorite(routeId);
+  }
+
+  Future<Map<String, dynamic>> topUpWallet(double amount) {
+    return api.post('${ApiConfig.wallet}/top-up', body: {'amount': amount});
   }
 
   Future<Map<String, dynamic>> createTicketScan() {
@@ -141,12 +181,61 @@ class AppServices {
     return api.post('${ApiConfig.wallet}/ticket/save');
   }
 
-  Future<Map<String, dynamic>> addPaymentMethod() {
-    return api.post('${ApiConfig.wallet}/payment-methods');
+  Future<Map<String, dynamic>> addPaymentMethod({
+    required String cardHolder,
+    required String cardNumber,
+    required String cardType,
+    required String expiry,
+  }) {
+    return api.post('${ApiConfig.wallet}/payment-methods', body: {
+      'card_holder': cardHolder,
+      'card_number': cardNumber,
+      'card_type': cardType,
+      'expiry': expiry,
+    });
+  }
+
+  Future<Map<String, dynamic>> activatePaymentMethod(int pmId) {
+    return api.post('${ApiConfig.wallet}/payment-methods/$pmId/activate');
+  }
+
+  Future<Map<String, dynamic>> deactivateAllPaymentMethods() {
+    return api.post('${ApiConfig.wallet}/payment-methods/deactivate-all');
+  }
+
+  Future<Map<String, dynamic>> deletePaymentMethod(int pmId) {
+    return api.delete('${ApiConfig.wallet}/payment-methods/$pmId');
+  }
+
+  Future<Map<String, dynamic>> reportIncident({
+    required String category,
+    required String severity,
+    required String details,
+    String? vehicleId,
+    String? routeId,
+    String? locationLabel,
+    double? lat,
+    double? lon,
+  }) {
+    return api.post('/incidents', body: {
+      'category': category,
+      'severity': severity,
+      'details': details,
+      'vehicle_id': vehicleId,
+      'route_id': routeId,
+      'location_label': locationLabel,
+      'lat': lat,
+      'lon': lon,
+      'source': 'passenger_app',
+    });
   }
 
   Future<Map<String, dynamic>> markNotificationsRead() {
     return api.post('${ApiConfig.notifications}/mark-read');
+  }
+
+  Future<Map<String, dynamic>> markSingleNotificationRead(String notificationId) {
+    return api.post('${ApiConfig.notifications}/$notificationId/mark-read');
   }
 
   Future<Map<String, dynamic>> startTrip([String? routeId]) async {

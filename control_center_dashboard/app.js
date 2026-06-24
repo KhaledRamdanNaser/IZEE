@@ -1,7 +1,10 @@
 const state = {
   view: new URLSearchParams(window.location.search).get("view") || "dashboard",
   incidentTab: "active",
+  analyticsTab: "live",
 };
+
+let surveyMap = null;
 
 const API_BASE_URL = window.IZEE_API_BASE_URL || "http://127.0.0.1:8000";
 
@@ -48,17 +51,14 @@ const vehicles = [
   ["#2491", "Route 34", "45 km/h", "39", "green", 82, 62],
 ];
 
-let liveVehicles = vehicles.map(([id, route, speed, pax, tone, x, y]) => ({
-  id,
-  route,
-  speed,
-  pax,
-  tone,
-  x,
-  y,
-  source: "demo",
-}));
+// The live map intentionally starts empty.  It is populated only from the
+// tracking endpoint; demo vehicles must never appear in operations view.
+let liveVehicles = [];
 let liveVehicleError = "";
+let selectedLiveRoute = "all";
+let selectedLiveVehicleId = null;
+let selectedVehicleRouteGeometry = [];
+let liveMap = null;
 
 const incidents = [
   ["Vehicle Breakdown - Route 8", "Engine failure on vehicle #2488 at Heliopolis", "Heliopolis, Abbas El Akkad St", "Driver - Mohamed Ali", "2024-12-24 09:45", "Field Team Alpha", "In Progress", "INC-2024-001", "critical"],
@@ -66,18 +66,19 @@ const incidents = [
   ["Scheduled Maintenance Alert", "Vehicle #2490 due for inspection", "Main Depot", "System Auto-Alert", "2024-12-24 07:00", "Maintenance Team", "In Progress", "INC-2024-004", "warning"],
 ];
 let liveIncidents = incidents;
+let incidentFilterStatus = "active";
+let incidentFilterSource = "all";
+let supervisorServiceChecks = [];
 let incidentError = "";
-let controlMessages = [
-  ["Weather Alert", "To: All Drivers", "Heavy rain expected 2-4 PM. Drive safely.", "10:30 AM", "Delivered"],
-  ["Route Adjustment", "To: Route 8 Drivers", "Temporary detour at Heliopolis due to roadwork.", "09:15 AM", "Delivered"],
-  ["Meeting Reminder", "To: Supervisor Team", "Weekly review at 3 PM today in main office.", "Yesterday", "Read"],
-];
+let controlMessages = [];
 let messageError = "";
 let messageDraft = {
-  recipients: "all_drivers",
+  recipientId: "all",
   subject: "",
   body: "",
 };
+let messageAudienceTab = "drivers";
+let messagingStats = { messages_sent_today: 0, active_recipients: 0, active_drivers: 0, active_supervisors: 0, broadcast_messages_today: 0 };
 
 function html(strings, ...values) {
   return strings.reduce((out, str, i) => out + str + (values[i] ?? ""), "");
@@ -126,8 +127,7 @@ function statusTone(status) {
 function dashboardMetrics() {
   return metrics.map((metric) => {
     if (metric[0] === "Active Vehicles") {
-      const realCount = liveVehicles.filter((vehicle) => vehicle.source !== "demo").length;
-      return [metric[0], String(realCount || liveVehicles.length), liveVehicleError || "From live vehicle endpoint", metric[3], metric[4]];
+      return [metric[0], String(liveVehicles.length), liveVehicleError || "From live vehicle endpoint", metric[3], metric[4]];
     }
     return metric;
   });
@@ -157,11 +157,14 @@ async function loadLiveVehicles() {
   try {
     const data = await getJson(`${API_BASE_URL}/vehicles/live?limit=100&_=${Date.now()}`);
     const rows = Array.isArray(data.vehicles) ? data.vehicles : [];
-    liveVehicleError = rows.length ? "" : "No live rows yet";
-    if (rows.length) {
-      liveVehicles = rows.map((vehicle) => ({
+    liveVehicleError = rows.length ? "" : "No active vehicles yet";
+    liveVehicles = rows
+      .filter((vehicle) => vehicle.status !== "stale" && vehicle.status !== "unavailable")
+      .filter((vehicle) => vehicle.route_id && Number.isFinite(Number(vehicle.lat)) && Number.isFinite(Number(vehicle.lon)))
+      .map((vehicle) => ({
         id: vehicle.vehicle_id || "Unknown",
-        route: vehicle.source || "Live vehicle",
+        routeId: String(vehicle.route_id),
+        route: vehicle.route_name || vehicle.route_label || vehicle.route_id,
         speed: `${Math.round(vehicle.speed_kmh || 0)} km/h`,
         pax: "-",
         tone: statusTone(vehicle.status),
@@ -170,7 +173,12 @@ async function loadLiveVehicles() {
         source: vehicle.source || "backend",
         area: vehicle.area || `${vehicle.lat}, ${vehicle.lon}`,
         updated: vehicle.timestamp || "",
+        lat: Number(vehicle.lat),
+        lon: Number(vehicle.lon),
       }));
+    if (selectedLiveVehicleId && !liveVehicles.some(vehicle => vehicle.id === selectedLiveVehicleId)) {
+      selectedLiveVehicleId = null;
+      selectedVehicleRouteGeometry = [];
     }
   } catch (error) {
     liveVehicleError = `Cannot reach backend at ${API_BASE_URL}`;
@@ -180,25 +188,41 @@ async function loadLiveVehicles() {
 
 async function loadIncidents() {
   try {
-    const data = await getJson(`${API_BASE_URL}/incidents?limit=100&_=${Date.now()}`);
+    const data = await getJson(`${API_BASE_URL}/incidents?scope=control_center&limit=100&_=${Date.now()}`);
     const rows = Array.isArray(data.incidents) ? data.incidents : [];
     incidentError = rows.length ? "" : "No incidents stored yet";
     if (rows.length) {
       liveIncidents = rows.map((incident) => {
         const status = incident.status === "new" ? "New" : incident.status || "In Progress";
         const level = incident.severity === "critical" ? "critical" : "warning";
-        const title = `${incident.category} - ${incident.vehicle_id || "Vehicle"}`;
+        const isServiceCheck = incident.raw_payload?.report_type === "service_check" || incident.category === "Service Check";
+        const title = isServiceCheck
+          ? `Service Check - ${incident.vehicle_id || "Vehicle"}`
+          : `${incident.category} - ${incident.vehicle_id || "Vehicle"}`;
         const place = incident.location_label || [incident.lat, incident.lon].filter(Boolean).join(", ") || "Unknown location";
+        
+        let reporter = "Unknown";
+        if (incident.source === "passenger_app") {
+          reporter = `Passenger`;
+        } else if (incident.source === "supervisor_app") {
+          reporter = `Supervisor`;
+        } else if (incident.source === "driver_app") {
+          reporter = `Driver - ${incident.vehicle_id || "Unknown"}`;
+        } else {
+          reporter = incident.source || "Driver";
+        }
+
         return [
           title,
           incident.details || "Driver submitted incident report",
           place,
-          `Driver - ${incident.vehicle_id || "Unknown"}`,
+          reporter,
           incident.created_at || "",
-          "Control Center",
+          incident.transmitted_to_control ? "Received by Control Center" : "Control Center",
           status,
           incident.incident_id || "",
           level,
+          incident.source,
         ];
       });
     }
@@ -208,33 +232,55 @@ async function loadIncidents() {
   if (state.view === "incidents" || state.view === "dashboard") render();
 }
 
+async function loadServiceChecks() {
+  try {
+    const data = await getJson(`${API_BASE_URL}/service-checks?_=${Date.now()}`);
+    if (data && Array.isArray(data.service_checks)) {
+      supervisorServiceChecks = data.service_checks;
+    }
+  } catch (error) {
+    console.error("Failed to load service checks:", error);
+  }
+}
+
 async function loadControlMessages() {
   try {
-    const data = await getJson(`${API_BASE_URL}/messages?limit=20&_=${Date.now()}`);
+    const data = await getJson(`${API_BASE_URL}/messages?limit=1000&_=${Date.now()}`);
     const rows = Array.isArray(data.messages) ? data.messages : [];
     messageError = rows.length ? "" : "No messages sent yet";
-    if (rows.length) {
-      controlMessages = rows.map((message) => [
-        message.subject || "Control Center Message",
-        `To: ${message.recipient_type || "all_drivers"}`,
-        message.body || "",
-        message.created_at || "",
-        message.read ? "Read" : "Delivered",
-      ]);
-    }
+    controlMessages = rows;
   } catch (error) {
     messageError = `Cannot reach messages API at ${API_BASE_URL}`;
   }
   if (state.view === "communications") render();
 }
 
+async function loadMessagingStats() {
+  try {
+    messagingStats = await getJson(`${API_BASE_URL}/control-center/messaging/stats?_=${Date.now()}`);
+  } catch (_) {
+    // Keep the last successful value; presence is not inferred from database users.
+  }
+  if (state.view === "users") {
+    // The per-user status comes from the same socket registry. Reload the
+    // directory whenever stats change so its rows match Active Now immediately.
+    await loadCcUsers();
+    render();
+  } else if (state.view === "communications") {
+    render();
+  }
+}
+
 async function sendControlMessage(event) {
   event.preventDefault();
   const form = event.currentTarget;
-  const recipient = form.elements.recipients.value;
-  const subject = form.elements.subject.value.trim();
+  const recipientId = form.elements.recipient_id.value;
+  const subject = form.elements.subject ? form.elements.subject.value.trim() : "";
   const body = form.elements.body.value.trim();
-  if (!subject || !body) return;
+  if ((!subject && messageAudienceTab !== "supervisors") || !body || (messageAudienceTab === "supervisors" && !recipientId)) return;
+
+  const isSupervisor = messageAudienceTab === "supervisors";
+  const isDriverBroadcast = !isSupervisor && recipientId === "all";
 
   try {
     const request = new XMLHttpRequest();
@@ -244,21 +290,43 @@ async function sendControlMessage(event) {
       request.onload = () => request.status >= 200 && request.status < 300 ? resolve() : reject(new Error(`HTTP ${request.status}`));
       request.onerror = () => reject(new Error("Network request failed"));
       request.send(JSON.stringify({
-        recipient_type: recipient,
+        recipient_type: isSupervisor ? "supervisor" : (isDriverBroadcast ? "all_drivers" : "driver"),
+        recipient_id: isDriverBroadcast ? null : recipientId,
         sender: "Control Center",
-        subject,
+        subject: isSupervisor ? "" : subject,
         body,
         priority: subject.toLowerCase().includes("urgent") ? "urgent" : "normal",
         source: "control_center",
       }));
     });
     form.reset();
-    messageDraft = { recipients: "all_drivers", subject: "", body: "" };
-    await loadControlMessages();
+    messageDraft = { recipientId: "all", subject: "", body: "" };
+    // Refresh both data sources so the counters immediately reflect the send
+    // and the current number of available recipients.
+    await Promise.all([loadControlMessages(), loadCcUsers(), loadMessagingStats()]);
+    if (state.view === "communications") render();
   } catch (error) {
     messageError = `Could not send message: ${error.message}`;
     render();
   }
+}
+
+window.setMessageAudienceTab = (tab) => {
+  syncMessageDraft();
+  messageAudienceTab = tab;
+  messageDraft.recipientId = tab === "drivers" ? "all" : "";
+  render();
+};
+
+function syncMessageDraft() {
+  const form = document.querySelector("#message-form");
+  if (!form) return;
+
+  messageDraft = {
+    recipientId: form.elements.recipient_id?.value || "",
+    subject: form.elements.subject?.value || "",
+    body: form.elements.body?.value || "",
+  };
 }
 
 function renderDashboard() {
@@ -305,42 +373,65 @@ function renderDashboard() {
   `;
 }
 
+function activeMapVehicles() {
+  return selectedLiveRoute === "all"
+    ? liveVehicles
+    : liveVehicles.filter(vehicle => vehicle.routeId === selectedLiveRoute);
+}
+
+window.selectLiveRoute = (routeId) => {
+  selectedLiveRoute = routeId;
+  selectedLiveVehicleId = null;
+  selectedVehicleRouteGeometry = [];
+  render();
+};
+
+window.selectLiveVehicle = async (vehicleId) => {
+  selectedLiveVehicleId = vehicleId;
+  selectedVehicleRouteGeometry = [];
+  render();
+  try {
+    const data = await getJson(`${API_BASE_URL}/driver/route-info?vehicle_id=${encodeURIComponent(vehicleId)}`);
+    const route = data.route || data;
+    const geometry = Array.isArray(route.geometry) ? route.geometry : [];
+    selectedVehicleRouteGeometry = geometry
+      .map(point => [Number(point.lat), Number(point.lon)])
+      .filter(([lat, lon]) => Number.isFinite(lat) && Number.isFinite(lon));
+  } catch (error) {
+    console.warn("Route geometry unavailable for selected vehicle", error);
+  }
+  if (selectedLiveVehicleId === vehicleId && state.view === "map") render();
+};
+
 function renderMap() {
+  const mapVehicles = activeMapVehicles();
+  const routeOptions = [...new Map(liveVehicles.map(vehicle => [vehicle.routeId, vehicle.route])).entries()];
+  const selectedVehicle = liveVehicles.find(vehicle => vehicle.id === selectedLiveVehicleId);
   return html`
     <div class="toolbar">
       <div class="filters">
-        <button class="btn primary">All Routes (284)</button>
-        <button class="btn">Route 1 (12)</button>
-        <button class="btn">Route 8 (8)</button>
-        <button class="btn">Route 15 (10)</button>
-        <button class="btn">Route 22 (6)</button>
-        <button class="btn">More Filters</button>
+        <button class="btn ${selectedLiveRoute === "all" ? "primary" : ""}" onclick="selectLiveRoute('all')">All Routes (${liveVehicles.length})</button>
+        ${routeOptions.map(([routeId, routeName]) => `<button class="btn ${selectedLiveRoute === routeId ? "primary" : ""}" onclick="selectLiveRoute('${escapeHtml(routeId)}')">${escapeHtml(routeName)} (${liveVehicles.filter(vehicle => vehicle.routeId === routeId).length})</button>`).join("")}
       </div>
       <div class="actions">
-        <label class="meta"><input type="checkbox" checked> Auto-refresh (30s)</label>
-        <button class="btn primary">Refresh Now</button>
+        <label class="meta"><input type="checkbox" checked disabled> Auto-refresh</label>
+        <button class="btn primary" onclick="loadLiveVehicles()">Refresh Now</button>
       </div>
     </div>
     <div class="map-layout">
       <section class="map-canvas" aria-label="Vehicle map preview">
-        <div class="zoom"><button>+</button><button>-</button></div>
-        ${liveVehicles.map((vehicle) => `<div class="map-marker ${vehicle.tone}" title="${vehicle.id} ${vehicle.area || ""}" style="left:${vehicle.x}%;top:${vehicle.y}%">${icon("icon-bus")}</div>`).join("")}
-        <div class="legend">
-          <span><span class="dot"></span>On Time</span>
-          <span><span class="dot orange"></span>Delayed</span>
-          <span><span class="dot gray"></span>Stopped</span>
-          <span><span class="dot red"></span>Incident</span>
-        </div>
+        <div id="live-map" class="leaflet-live-map"></div>
+        ${selectedVehicle ? `<div class="map-selection"><strong>${escapeHtml(selectedVehicle.id)}</strong><span>${escapeHtml(selectedVehicle.route)}</span><button aria-label="Clear selected vehicle" onclick="selectLiveRoute('${escapeHtml(selectedLiveRoute)}')">×</button></div>` : '<div class="map-selection map-selection-muted">Select a vehicle to show it and its route on the map.</div>'}
       </section>
       <section class="card">
-        <h3 class="card-title">Active Vehicles</h3>
+        <h3 class="card-title">${selectedLiveRoute === "all" ? "Active Vehicles" : `Active Vehicles — ${escapeHtml(routeOptions.find(([id]) => id === selectedLiveRoute)?.[1] || selectedLiveRoute)}`}</h3>
         ${liveVehicleError ? `<p class="meta">${liveVehicleError}</p>` : ""}
         <div class="vehicle-list">
-          ${liveVehicles.map((vehicle) => html`
-            <div class="vehicle-row">
+          ${mapVehicles.length === 0 ? '<p class="meta">No active vehicles for this route.</p>' : mapVehicles.map((vehicle) => html`
+            <button class="vehicle-row vehicle-select ${vehicle.id === selectedLiveVehicleId ? "is-selected" : ""}" type="button" onclick="selectLiveVehicle('${escapeHtml(vehicle.id)}')">
               <div class="row-line"><strong><span class="dot ${vehicle.tone}"></span>Vehicle ${vehicle.id}</strong><span class="meta">${vehicle.route}</span></div>
               <div class="row-line"><span class="meta">Speed: ${vehicle.speed}</span><span class="meta">${vehicle.area || ""}</span></div>
-            </div>
+            </button>
           `).join("")}
         </div>
       </section>
@@ -348,7 +439,25 @@ function renderMap() {
   `;
 }
 
+window.switchAnalyticsTab = (tab) => {
+  state.analyticsTab = tab;
+  render();
+};
+
 function renderAnalytics() {
+  const activeTab = state.analyticsTab || "live";
+  return html`
+    <div class="toolbar" style="margin-bottom: 24px; border-bottom: 1px solid var(--line); padding-bottom: 12px;">
+      <div class="filters">
+        <button class="btn ${activeTab === 'live' ? 'primary' : ''}" onclick="switchAnalyticsTab('live')">Live Operations</button>
+        <button class="btn ${activeTab === 'survey' ? 'primary' : ''}" onclick="switchAnalyticsTab('survey')">Cairo Travel Survey Insights</button>
+      </div>
+    </div>
+    ${activeTab === "live" ? renderLiveAnalytics() : renderSurveyAnalytics()}
+  `;
+}
+
+function renderLiveAnalytics() {
   return html`
     <div class="grid two-col">
       <section class="card chart-card">
@@ -392,6 +501,181 @@ function renderAnalytics() {
   `;
 }
 
+function renderSurveyAnalytics() {
+  const survey = window.SURVEY_DATA || {
+    total_records: 0,
+    mode_split: {},
+    hourly_purpose: {},
+    demographics: { gender: {}, age: {}, income: {} },
+    hotspots: []
+  };
+
+  // 1. Calculate highlights
+  let dominantMode = "N/A";
+  let maxModeCount = 0;
+  for (const [mode, count] of Object.entries(survey.mode_split)) {
+    if (count > maxModeCount) {
+      maxModeCount = count;
+      dominantMode = mode;
+    }
+  }
+
+  let peakHour = "N/A";
+  let maxHourCount = 0;
+  for (const [hour, purposes] of Object.entries(survey.hourly_purpose)) {
+    const totalHourCount = Object.values(purposes).reduce((sum, val) => sum + val, 0);
+    if (totalHourCount > maxHourCount) {
+      maxHourCount = totalHourCount;
+      peakHour = hour;
+    }
+  }
+
+  let dominantPurpose = "N/A";
+  let maxPurposeCount = 0;
+  const purposeCounts = {};
+  for (const [hour, purposes] of Object.entries(survey.hourly_purpose)) {
+    for (const [purpose, count] of Object.entries(purposes)) {
+      purposeCounts[purpose] = (purposeCounts[purpose] || 0) + count;
+    }
+  }
+  for (const [purpose, count] of Object.entries(purposeCounts)) {
+    if (purpose === "other" || purpose === "no_answer" || purpose === "") continue;
+    if (count > maxPurposeCount) {
+      maxPurposeCount = count;
+      dominantPurpose = purpose;
+    }
+  }
+
+  dominantMode = dominantMode.replace(/_/g, " ");
+  dominantMode = dominantMode.charAt(0).toUpperCase() + dominantMode.slice(1);
+  dominantPurpose = dominantPurpose.charAt(0).toUpperCase() + dominantPurpose.slice(1);
+
+  const totalModesCount = Object.values(survey.mode_split).reduce((sum, val) => sum + val, 0) || 1;
+  const sortedModes = Object.entries(survey.mode_split).sort((a, b) => b[1] - a[1]);
+
+  const hours = Object.keys(survey.hourly_purpose).sort();
+  const hourlyTotals = hours.map(h => {
+    return Object.values(survey.hourly_purpose[h]).reduce((sum, val) => sum + val, 0);
+  });
+  const maxHourlyVolume = Math.max(...hourlyTotals, 1);
+
+  return html`
+    <div class="grid kpi-grid" style="margin-bottom:24px">
+      ${[
+        ["Surveyed Commuters", Number(survey.total_records).toLocaleString(), "Total Cairo respondents", "icon-users", "green"],
+        ["Dominant Mode", dominantMode, `${maxModeCount.toLocaleString()} trips`, "icon-bus", "blue"],
+        ["Peak Travel Hour", peakHour, `Highest hourly density`, "icon-pulse", "orange"],
+        ["Primary Trip Purpose", dominantPurpose, `${maxPurposeCount.toLocaleString()} commutes`, "icon-trend", "purple"],
+      ].map(metricCard).join("")}
+    </div>
+
+    <div class="grid two-col">
+      <section class="card chart-card">
+        <h3 class="card-title">Hourly Travel Volume</h3>
+        <div class="chart-box">
+          <svg class="bar-chart" viewBox="0 0 720 250" role="img" aria-label="Hourly travel volume">
+            <g stroke="#e5e7eb">
+              ${[40, 80, 120, 160, 200].map(y => `<line x1="40" x2="690" y1="${y}" y2="${y}"/>`).join("")}
+            </g>
+            ${hours.map((h, i) => {
+              const count = hourlyTotals[i];
+              const barHeight = (count / maxHourlyVolume) * 160;
+              const x = 50 + i * 26;
+              const y = 210 - barHeight;
+              const labelText = i % 4 === 0 ? h : "";
+              return html`
+                <rect x="${x}" y="${y}" width="18" height="${barHeight}" fill="var(--blue)" rx="2">
+                  <title>${h}: ${count} trips</title>
+                </rect>
+                ${labelText ? html`<text x="${x - 4}" y="232" fill="#667085" font-size="10">${labelText}</text>` : ""}
+              `;
+            }).join("")}
+          </svg>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3 class="card-title">Mode Choice Split</h3>
+        <div style="display:flex; flex-direction:column; gap:16px; justify-content:center; min-height:220px; padding:10px 0;">
+          ${sortedModes.slice(0, 7).map(([mode, count]) => {
+            const pct = ((count / totalModesCount) * 100).toFixed(1);
+            return html`
+              <div class="progress-bar-container">
+                <span class="mode-label">${mode.replace(/_/g, ' ')}</span>
+                <div class="progress-bar-bg">
+                  <div class="progress-bar-fill" style="width:${pct}%;"></div>
+                </div>
+                <span class="meta mode-pct">${pct}%</span>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </section>
+    </div>
+
+    <div class="grid two-col" style="margin-top:24px">
+      <section class="card">
+        <h3 class="card-title">Cairo Travel Hotspots (Origins & Destinations)</h3>
+        <p class="meta" style="margin-top:-14px; margin-bottom:14px;">
+          Visualizing Cairo travel patterns. Green is Origin, Red is Destination. Hover over paths to view direction and commuter profiles.
+        </p>
+        <div id="survey-map" style="min-height: 400px; height: 400px; border-radius: 8px; border: 1px solid var(--line); position: relative; z-index: 10;"></div>
+      </section>
+
+      <section class="card" style="display:flex; flex-direction:column; gap:20px;">
+        <h3 class="card-title" style="margin-bottom:10px;">Commuter Demographics</h3>
+        
+        <div>
+          <h4 style="margin:0 0 10px; font-size:14px; color:var(--muted)">Gender Distribution</h4>
+          ${Object.entries(survey.demographics.gender)
+            .filter(([gender]) => gender !== "no_answer" && gender !== "no answer" && gender !== "")
+            .map(([gender, count], _, arr) => {
+              const total = arr.reduce((sum, [_, c]) => sum + c, 0) || 1;
+              const pct = ((count / total) * 100).toFixed(1);
+              return html`
+                <div class="progress-bar-container">
+                  <span class="demog-label" style="text-transform:capitalize;">${gender}</span>
+                  <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%; background:var(--green-2)"></div></div>
+                  <span class="meta demog-pct">${pct}%</span>
+                </div>
+              `;
+            }).join("")}
+        </div>
+
+        <div>
+          <h4 style="margin:0 0 10px; font-size:14px; color:var(--muted)">Age Demographics</h4>
+          ${Object.entries(survey.demographics.age).sort().slice(0, 6).map(([age, count]) => {
+            const total = Object.values(survey.demographics.age).reduce((a,b)=>a+b, 0) || 1;
+            const pct = ((count / total) * 100).toFixed(1);
+            return html`
+              <div class="progress-bar-container">
+                <span class="demog-label">${age}</span>
+                <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%; background:var(--orange)"></div></div>
+                <span class="meta demog-pct">${pct}%</span>
+              </div>
+            `;
+          }).join("")}
+        </div>
+
+        <div>
+          <h4 style="margin:0 0 10px; font-size:14px; color:var(--muted)">Income Distribution (EGP)</h4>
+          ${Object.entries(survey.demographics.income).sort().slice(0, 6).map(([income, count]) => {
+            const total = Object.values(survey.demographics.income).reduce((a,b)=>a+b, 0) || 1;
+            const pct = ((count / total) * 100).toFixed(1);
+            return html`
+              <div class="progress-bar-container">
+                <span class="demog-label">${income.replace('no_answer', 'Unknown')}</span>
+                <div class="progress-bar-bg"><div class="progress-bar-fill" style="width:${pct}%; background:var(--purple)"></div></div>
+                <span class="meta demog-pct">${pct}%</span>
+              </div>
+            `;
+          }).join("")}
+        </div>
+      </section>
+    </div>
+  `;
+}
+
 function performanceTable() {
   const data = [
     ["Route 1", "145", "92%", "2.3 min", "Excellent", "green"],
@@ -408,69 +692,179 @@ function performanceTable() {
   `;
 }
 
+window.setIncidentFilterStatus = (status) => {
+  incidentFilterStatus = status;
+  render();
+};
+
+window.setIncidentFilterSource = (source) => {
+  incidentFilterSource = source;
+  render();
+};
+
 function renderIncidents() {
-  const activeIncidents = liveIncidents.filter((incident) => incident[6] !== "resolved");
+  // 1. Status Filter
+  let filtered = liveIncidents;
+  if (incidentFilterStatus === "active") {
+    filtered = filtered.filter((inc) => inc[6].toLowerCase() !== "resolved");
+  } else if (incidentFilterStatus === "resolved") {
+    filtered = filtered.filter((inc) => inc[6].toLowerCase() === "resolved");
+  }
+
+  // 2. Source Filter (index 9)
+  if (incidentFilterSource === "passenger") {
+    filtered = filtered.filter((inc) => inc[9] === "passenger_app");
+  } else if (incidentFilterSource === "driver") {
+    filtered = filtered.filter((inc) => inc[9] === "driver_app" || !inc[9]);
+  } else if (incidentFilterSource === "supervisor") {
+    filtered = filtered.filter((inc) => inc[9] === "supervisor_app");
+  }
+
+  // Count helper functions for the UI badges
+  const activeCount = liveIncidents.filter((inc) => inc[6].toLowerCase() !== "resolved").length;
+  const resolvedCount = liveIncidents.filter((inc) => inc[6].toLowerCase() === "resolved").length;
+  const allCount = liveIncidents.length;
+
+  const passengerCount = liveIncidents.filter((inc) => inc[9] === "passenger_app").length;
+  const driverCount = liveIncidents.filter((inc) => inc[9] === "driver_app" || !inc[9]).length;
+  const supervisorCount = liveIncidents.filter((inc) => inc[9] === "supervisor_app").length;
+
   return html`
     <div class="grid four-metrics kpi-grid">
       ${[
-        ["Critical", "1", "", "icon-alert", "red"],
-        ["Warning", "2", "", "icon-alert", "orange"],
-        ["Resolved Today", "3", "", "OK", "green"],
-        ["Avg Response Time", "8m", "", "TIME", "blue"],
+        ["Critical", String(filtered.filter(inc => inc[8] === "critical").length), "", "icon-alert", "red"],
+        ["Warning", String(filtered.filter(inc => inc[8] === "warning").length), "", "icon-alert", "orange"],
+        ["Resolved", String(liveIncidents.filter(inc => inc[6].toLowerCase() === "resolved").length), "", "OK", "green"],
+        ["Filtered Count", String(filtered.length), "", "LIST", "blue"],
       ].map(metricCard).join("")}
     </div>
     <section class="card" style="margin-top:24px">
-      <div class="toolbar">
-        <div class="filters">
-          <button class="btn primary">Active Incidents (${activeIncidents.length})</button>
-          <button class="btn">Resolved (1)</button>
-          <button class="btn">All (4)</button>
+      <div class="toolbar" style="display:flex; flex-direction:column; gap:16px; align-items:start;">
+        <div style="display:flex; justify-content:space-between; width:100%; align-items:center; flex-wrap:wrap; gap:12px;">
+          <div class="filters" style="display:flex; gap:8px;">
+            <button class="btn ${incidentFilterStatus === "active" ? "primary" : ""}" onclick="setIncidentFilterStatus('active')">Active Incidents (${activeCount})</button>
+            <button class="btn ${incidentFilterStatus === "resolved" ? "primary" : ""}" onclick="setIncidentFilterStatus('resolved')">Resolved (${resolvedCount})</button>
+            <button class="btn ${incidentFilterStatus === "all" ? "primary" : ""}" onclick="setIncidentFilterStatus('all')">All (${allCount})</button>
+          </div>
+          <button class="btn primary">Create New Incident</button>
         </div>
-        <button class="btn primary">Create New Incident</button>
+        
+        <div class="filters" style="display:flex; gap:8px; border-top: 1px solid #f1f5f9; padding-top:12px; width:100%;">
+          <span style="font-weight:600; color:#475569; align-self:center; margin-right:8px;">Source:</span>
+          <button class="btn ${incidentFilterSource === "all" ? "primary" : ""}" onclick="setIncidentFilterSource('all')">All Sources</button>
+          <button class="btn ${incidentFilterSource === "passenger" ? "primary" : ""}" onclick="setIncidentFilterSource('passenger')">Passenger (${passengerCount})</button>
+          <button class="btn ${incidentFilterSource === "driver" ? "primary" : ""}" onclick="setIncidentFilterSource('driver')">Driver (${driverCount})</button>
+          <button class="btn ${incidentFilterSource === "supervisor" ? "primary" : ""}" onclick="setIncidentFilterSource('supervisor')">Supervisor (${supervisorCount})</button>
+        </div>
       </div>
+      
       ${incidentError ? `<p class="meta">${incidentError}</p>` : ""}
-      <div class="alert-list">
-        ${liveIncidents.map(([title, desc, place, driver, time, team, status, id, level]) => html`
+      <div class="alert-list" style="margin-top:16px;">
+        ${filtered.map(([title, desc, place, driver, time, team, status, id, level]) => html`
           <article class="incident-card ${level === "warning" ? "warning" : ""}">
-            <div class="incident-title">${title} ${badge(status, status === "New" ? "blue" : "orange")} <span class="meta">${id}</span></div>
+            <div class="incident-title">${title} ${badge(status, status.toLowerCase() === "new" ? "blue" : (status.toLowerCase() === "resolved" ? "green" : "orange"))} <span class="meta">${id}</span></div>
             <div>${desc}</div>
             <div class="incident-meta">
-              <span>Loc: ${place}</span><span>${driver}</span><span>${time}</span><span>${team}</span>
+              <span>Loc: ${place}</span><span>Reporter: ${driver}</span><span>${time}</span><span>${team}</span>
             </div>
-            <div class="filters"><button class="btn primary">${status === "New" ? "Acknowledge" : "Mark Resolved"}</button><button class="btn">View Details</button><button class="btn">Assign</button></div>
+            <div class="filters"><button class="btn primary">${status.toLowerCase() === "new" ? "Acknowledge" : "Mark Resolved"}</button><button class="btn">View Details</button><button class="btn">Assign</button></div>
           </article>
         `).join("")}
+        ${filtered.length === 0 ? html`<div style="text-align:center; padding:32px; color:#667085; font-weight:500;">No incidents match the selected filter.</div>` : ""}
       </div>
     </section>
   `;
 }
 
 function renderCommunications() {
+  const audience = messageAudienceTab === "supervisors" ? "supervisors" : "drivers";
+  const people = audience === "supervisors" ? ccAllSupervisors : ccAllDrivers;
+  const recipientOptions = [
+    ...(audience === "drivers" ? [{ id: "all", label: "All Drivers (broadcast)" }] : []),
+    ...people.map(person => ({
+      id: person.driver_id,
+      label: `${person.name || person.driver_id} (${person.driver_id})`,
+    })),
+  ];
+  const visibleMessages = controlMessages.filter((message) => {
+    const recipientType = String(message.recipient_type || "").toLowerCase();
+    const sender = String(message.sender || "").toLowerCase();
+    const isSupervisorConversation =
+      message.source === "supervisor_app" ||
+      recipientType === "supervisor" ||
+      recipientType === "supervisors" ||
+      sender.startsWith("supervisor_");
+    const isDriverConversation =
+      message.source === "driver_app" ||
+      recipientType === "driver" ||
+      recipientType === "all_drivers" ||
+      recipientType.endsWith("_drivers") ||
+      sender.startsWith("driver_");
+    return audience === "supervisors" ? isSupervisorConversation : isDriverConversation;
+  });
+  // The API stores created_at in UTC. Compare UTC calendar dates so a message
+  // sent shortly after Cairo midnight is still counted with the API's day.
+  const utcToday = new Date().toISOString().slice(0, 10);
+  const isToday = (message) => {
+    const createdAt = String(message.created_at || "");
+    return createdAt.slice(0, 10) === utcToday;
+  };
+  const isFromControlCenter = (message) =>
+    message.source === "control_center" ||
+    String(message.sender || "").toLowerCase() === "control center";
+  const messagesSentToday = controlMessages.filter(message =>
+    isFromControlCenter(message) && isToday(message)
+  ).length;
+  const broadcastMessagesToday = controlMessages.filter((message) => {
+    const recipientType = String(message.recipient_type || "").toLowerCase();
+    return isFromControlCenter(message) && isToday(message) &&
+      (recipientType === "all_drivers" || recipientType.endsWith("_drivers"));
+  }).length;
+  const activeRecipients = Number(messagingStats.active_recipients || 0);
   return html`
     <div class="grid three-col">
       ${[
-        ["Messages Sent Today", "24", "", "icon-message", "green"],
-        ["Active Recipients", "156", "", "icon-users", "blue"],
-        ["Broadcast Messages", "3", "", "ALL", "orange"],
+        ["Messages Sent Today", String(messagingStats.messages_sent_today || 0), "From Control Center", "icon-message", "green"],
+        ["Active Recipients", String(activeRecipients), `${messagingStats.active_drivers || 0} drivers · ${messagingStats.active_supervisors || 0} supervisors`, "icon-users", "blue"],
+        ["Broadcast Messages", String(messagingStats.broadcast_messages_today || 0), "Driver broadcasts sent today", "ALL", "orange"],
       ].map(metricCard).join("")}
     </div>
     <div class="grid two-col" style="margin-top:24px">
       <section class="card">
         <h3 class="card-title">Send New Message</h3>
         <form class="form-grid" id="message-form">
-          <div class="field span-2"><label>Recipients</label><select name="recipients"><option value="all_drivers" ${messageDraft.recipients === "all_drivers" ? "selected" : ""}>All Drivers</option><option value="route_8_drivers" ${messageDraft.recipients === "route_8_drivers" ? "selected" : ""}>Route 8 Drivers</option><option value="supervisors" ${messageDraft.recipients === "supervisors" ? "selected" : ""}>Supervisors</option></select></div>
-          <div class="field span-2"><label>Subject</label><input name="subject" value="${escapeHtml(messageDraft.subject)}" placeholder="Enter subject"></div>
+          <div class="field span-2">
+            <label>Recipients</label>
+            <div class="filters" style="margin-bottom:8px">
+              <button class="btn ${audience === "drivers" ? "primary" : ""}" type="button" onclick="setMessageAudienceTab('drivers')">Drivers</button>
+              <button class="btn ${audience === "supervisors" ? "primary" : ""}" type="button" onclick="setMessageAudienceTab('supervisors')">Supervisors</button>
+            </div>
+            <select name="recipient_id" required>
+              ${audience === "supervisors" ? '<option value="">Choose a supervisor…</option>' : ''}
+              ${recipientOptions.map(person => `<option value="${escapeHtml(person.id)}" ${messageDraft.recipientId === String(person.id) ? "selected" : ""}>${escapeHtml(person.label)}</option>`).join("")}
+            </select>
+            <p class="meta" style="margin-top:6px">${audience === "supervisors" ? "Messages are private to the selected supervisor." : "Choose one driver for a private message, or send a driver broadcast."}</p>
+          </div>
+          ${audience === "drivers" ? html`<div class="field span-2"><label>Subject</label><input name="subject" value="${escapeHtml(messageDraft.subject)}" placeholder="Enter subject"></div>` : ""}
           <div class="field span-2"><label>Message</label><textarea name="body" placeholder="Type your message here...">${escapeHtml(messageDraft.body)}</textarea></div>
           <div class="filters span-2"><button class="btn primary" type="submit">Send Message</button><button class="btn" type="button">Save Draft</button></div>
         </form>
       </section>
       <section class="card">
-        <h3 class="card-title">Recent Messages</h3>
+        <h3 class="card-title">${audience === "supervisors" ? "Supervisor Conversations" : "Driver Conversations"}</h3>
         ${messageError ? `<p class="meta">${messageError}</p>` : ""}
         <div class="message-list">
-          ${controlMessages.map(([title,to,msg,time,status]) => html`
-            <div class="message-row"><div class="row-line"><strong>${title}</strong><span class="meta">${time}</span></div><span class="meta">${to}</span><p>${msg}</p>${badge(status)}</div>
-          `).join("")}
+          ${visibleMessages.length === 0
+            ? `<p class="meta">No ${audience} messages yet.</p>`
+            : visibleMessages.map((message) => {
+              const fromSupervisor = message.source === "supervisor_app";
+              const fromDriver = message.source === "driver_app";
+              const title = message.subject || (fromSupervisor ? "Supervisor Message" : fromDriver ? "Driver Message" : "Control Center Message");
+              const direction = (fromSupervisor || fromDriver)
+                ? `From: ${message.sender || "Unknown"}`
+                : `To: ${message.recipient_id || message.recipient_type || "Unknown"}`;
+              return html`<div class="message-row"><div class="row-line"><strong>${escapeHtml(title)}</strong><span class="meta">${escapeHtml(message.created_at || "")}</span></div><span class="meta">${escapeHtml(direction)}</span><p>${escapeHtml(message.body || "")}</p>${badge(message.read ? "Read" : "Delivered")}</div>`;
+            }).join("")}
         </div>
       </section>
     </div>
@@ -479,6 +873,43 @@ function renderCommunications() {
 
 let ccUsers = [];
 let ccUsersError = "";
+let userSearch = "";
+
+window.setUserSearch = (input) => {
+  const value = input.value;
+  const cursor = input.selectionStart ?? value.length;
+  userSearch = value.toLowerCase();
+  render();
+  requestAnimationFrame(() => {
+    const replacement = document.getElementById("users-search");
+    if (!replacement) return;
+    replacement.focus();
+    replacement.setSelectionRange(cursor, cursor);
+  });
+};
+window.addControlCenterUser = async () => {
+  const user_id = prompt("User ID (for example: driver_101)")?.trim();
+  if (!user_id) return;
+  const name = prompt("Full name")?.trim();
+  const role = prompt("Role: Driver, Supervisor, or Operator", "Driver")?.trim();
+  if (!name || !role) return;
+  try { await postJson(`${API_BASE_URL}/control-center/users`, { user_id, name, role }); await loadCcUsers(); render(); }
+  catch (error) { alert(`Could not add user: ${error.message}`); }
+};
+window.editControlCenterUser = async (userId, name, role) => {
+  const nextName = prompt("Full name", name)?.trim();
+  const nextRole = prompt("Role: Driver, Supervisor, or Operator", role)?.trim();
+  if (!nextName || !nextRole) return;
+  try { await putJson(`${API_BASE_URL}/control-center/users/${encodeURIComponent(userId)}`, { user_id: userId, name: nextName, role: nextRole }); await loadCcUsers(); render(); }
+  catch (error) { alert(`Could not update user: ${error.message}`); }
+};
+window.toggleUserSuspension = async (userId, currentlySuspended) => {
+  const suspending = !currentlySuspended;
+  if (!confirm(suspending ? "Suspend this user? They will no longer be able to send or receive Control Center messages." : "Reactivate this user?")) return;
+  try { await postJson(`${API_BASE_URL}/control-center/users/${encodeURIComponent(userId)}/suspend`, { suspended: suspending }); await Promise.all([loadCcUsers(), loadMessagingStats()]); render(); }
+  catch (error) { alert(`Could not update user status: ${error.message}`); }
+};
+window.viewUserAssignment = (name, assignment) => alert(`${name}\nCurrent assignment: ${assignment || "None"}\n\nAssignment creation and editing remain managed by the Supervisor.`);
 let assignModalOpen = false;
 let assignDriverId = "";
 let assignDriverName = "";
@@ -494,6 +925,14 @@ window.openAssignModal = (driverId, driverName) => {
   assignDriverName = driverName;
   assignVehicleId = driverId;
   assignModalOpen = true;
+
+  const validRoutes = (ccBusRoutes || []).filter(r => (r.mode || "").toLowerCase() === "bus");
+  if (validRoutes.length > 0) {
+    assignRouteId = validRoutes[0].route_id;
+  } else {
+    assignRouteId = "Route 8";
+  }
+
   render();
 };
 
@@ -534,6 +973,11 @@ async function loadCcUsers() {
   try {
     const data = await getJson(`${API_BASE_URL}/control-center/drivers?_=${Date.now()}`);
     if (data && Array.isArray(data.users)) {
+      // Communications uses the same user directory as the Users page. Keep
+      // these recipient lists current here as well, rather than only when the
+      // Regions screen happens to load its metadata.
+      ccAllSupervisors = data.users.filter(u => u.role === "Supervisor");
+      ccAllDrivers = data.users.filter(u => u.role === "Driver");
       ccUsers = data.users.map(u => [
         u.name,
         u.role,
@@ -559,13 +1003,17 @@ function renderAssignModal() {
           <div class="field span-2" style="grid-column: span 2; display:flex;flex-direction:column;gap:6px;">
             <label style="font-weight:600;font-size:13px;color:#344054;">Select Route</label>
             <select name="route_id" onchange="assignRouteId = this.value" style="padding:10px;border:1px solid #d0d5dd;border-radius:6px;outline:none;font-size:14px;">
-              <option value="A-12 Express" ${assignRouteId === "A-12 Express" ? "selected" : ""}>A-12 Express</option>
-              <option value="B-20 Local" ${assignRouteId === "B-20 Local" ? "selected" : ""}>B-20 Local</option>
-              <option value="C-05 Shuttle" ${assignRouteId === "C-05 Shuttle" ? "selected" : ""}>C-05 Shuttle</option>
-              <option value="M2" ${assignRouteId === "M2" ? "selected" : ""}>M2 (Cairo Metro Line 2)</option>
-              <option value="Route 8" ${assignRouteId === "Route 8" ? "selected" : ""}>Route 8</option>
-              <option value="Route 15" ${assignRouteId === "Route 15" ? "selected" : ""}>Route 15</option>
-              <option value="Route 22" ${assignRouteId === "Route 22" ? "selected" : ""}>Route 22</option>
+              ${(ccBusRoutes || [])
+                .filter(r => (r.mode || "").toLowerCase() === "bus")
+                .map(r => html`
+                  <option value="${escapeHtml(r.route_id)}" ${assignRouteId === r.route_id ? "selected" : ""}>
+                    ${escapeHtml(r.route_long_name || r.route_short_name || r.route_id)}
+                  </option>
+                `).join("")}
+              ${(ccBusRoutes || []).filter(r => (r.mode || "").toLowerCase() === "bus").length === 0 ? html`
+                <option value="Route 8" ${assignRouteId === "Route 8" ? "selected" : ""}>Route 8</option>
+                <option value="Route 15" ${assignRouteId === "Route 15" ? "selected" : ""}>Route 15</option>
+              ` : ""}
             </select>
           </div>
           <div class="field" style="display:flex;flex-direction:column;gap:6px;">
@@ -607,32 +1055,46 @@ function renderUsers() {
     ["Omar Ibrahim", "Driver", "Route 22", "inactive", "2 days ago", "driver_test_003"],
     ["Sara Mahmoud", "Operator", "Control Center", "active", "Now", "operator_1"],
   ];
+  const filteredUsers = displayUsers.filter(([name, role, assignment, status, last, id]) =>
+    !userSearch || `${name} ${role} ${assignment} ${status} ${id}`.toLowerCase().includes(userSearch));
+  const totalUsers = displayUsers.length;
+  // Use the exact same WebSocket-presence total as Communications.
+  // Do not infer activity from stored database user statuses.
+  const activeUsers = Number(messagingStats.active_recipients || 0);
+  const lastActiveLabel = (value) => {
+    if (!value || value === "Never" || value === "Now") return value || "Never";
+    const time = new Date(value);
+    if (Number.isNaN(time.valueOf())) return value;
+    const seconds = Math.max(0, Math.floor((Date.now() - time.valueOf()) / 1000));
+    if (seconds < 60) return "Just now";
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+    if (seconds < 86400) return `${Math.floor(seconds / 3600)} hr ago`;
+    return `${Math.floor(seconds / 86400)} days ago`;
+  };
   return html`
     <div class="grid three-col">
       ${[
-        ["Total Users", "248", "", "icon-users", "green"],
-        ["Active Now", "156", "", "ON", "blue"],
-        ["New This Week", "5", "", "+", "orange"],
+        ["Total Users", String(totalUsers), "Current directory", "icon-users", "green"],
+        ["Active Now", String(activeUsers), "Matches messaging Active Recipients", "ON", "blue"],
+        ["New This Week", "—", "Not tracked", "+", "orange"],
       ].map(metricCard).join("")}
     </div>
     <section class="card" style="margin-top:24px">
       ${ccUsersError ? `<p style="color:#C5221F;font-weight:600;margin-bottom:12px;">${ccUsersError}</p>` : ""}
-      <div class="search-row"><input placeholder="Search users..."><button class="btn primary">Add New User</button></div>
+      <div class="search-row"><input id="users-search" value="${escapeHtml(userSearch)}" oninput="setUserSearch(this)" placeholder="Search users..."><button class="btn primary" onclick="addControlCenterUser()">Add New User</button></div>
       <table class="table">
         <thead><tr><th>Name</th><th>Role</th><th>Assignment</th><th>Status</th><th>Last Active</th><th>Actions</th></tr></thead>
-        <tbody>${displayUsers.map(([name, role, assignment, status, last, driver_id]) => html`
+        <tbody>${filteredUsers.map(([name, role, assignment, status, last, driver_id]) => html`
           <tr>
             <td><span class="avatar" style="display:inline-grid;width:32px;height:32px;margin-right:10px;align-items:center;justify-content:center;border-radius:50%;background:#e2e8f0;font-weight:bold;font-size:12px;color:#475569;">${name.split(" ").map(n => n[0]).join("")}</span>${name}</td>
             <td>${role}</td>
             <td>${assignment}</td>
-            <td>${badge(status, status === "active" ? "green" : "gray")}</td>
-            <td class="meta">${last}</td>
+            <td>${badge(status, status === "online" || status === "active" ? "green" : status === "suspended" ? "red" : "gray")}</td>
+            <td class="meta">${lastActiveLabel(last)}</td>
             <td>
-              ${role === "Driver" ? 
-                html`<button class="btn" onclick="alert('Assignments are read-only in the Control Center. Creating and updating duties must be done by the Supervisor.')">View Assignments</button> ` : 
-                html`<button class="btn">Edit</button> `
-              }
-              <button class="btn">Suspend</button>
+              ${role === "Driver" ? html`<button class="btn" onclick="viewUserAssignment('${escapeHtml(name)}','${escapeHtml(assignment)}')">View Assignment</button>` : ""}
+              <button class="btn" onclick="editControlCenterUser('${escapeHtml(driver_id)}','${escapeHtml(name)}','${escapeHtml(role)}')">Edit</button>
+              <button class="btn" onclick="toggleUserSuspension('${escapeHtml(driver_id)}', ${status === "suspended"})">${status === "suspended" ? "Reactivate" : "Suspend"}</button>
             </td>
           </tr>
         `).join("")}</tbody>
@@ -680,7 +1142,21 @@ function normalizedBusRouteOptions() {
     id: routeKey(route),
     label: routeDisplayName(route),
     mode: routeMode(route),
-  })).filter((route) => route.id);
+  })).filter((route) => {
+    const searchable = `${route.id} ${route.label}`.toLowerCase();
+    const shortName = String(route.route.route_short_name || "").trim().toLowerCase();
+    const knownPlaceholderIds = new Set(["CTA 1023", "Route 8", "Route 15", "A-12 Express"]);
+    return route.id &&
+      !knownPlaceholderIds.has(route.id) &&
+      String(route.mode).toLowerCase() === "bus" &&
+      Number(route.route.route_type) === 3 &&
+      shortName !== "box" &&
+      !searchable.includes("microbus") &&
+      !searchable.includes("minibus") &&
+      !searchable.includes("paratransit") &&
+      !searchable.includes("tomnaya") &&
+      !searchable.includes("suzuki");
+  });
 }
 
 function driverCheckboxId(prefix, driverId, index) {
@@ -1272,6 +1748,313 @@ function renderConfiguration() {
   `;
 }
 
+window.downloadServiceCheckFile = (incidentId) => {
+  const check = supervisorServiceChecks.find(c => c.incident_id === incidentId);
+  if (!check) {
+    alert("Report file data not loaded.");
+    return;
+  }
+  
+  const printWindow = window.open("", "_blank");
+  if (!printWindow) {
+    alert("Please allow popups to download/print the PDF report.");
+    return;
+  }
+
+  let checksHtml = "";
+  if (check.raw_payload?.checks) {
+    for (const [key, value] of Object.entries(check.raw_payload.checks)) {
+      checksHtml += `
+        <div class="checklist-item">
+          <span class="status-badge ${value ? 'pass' : 'fail'}">${value ? 'PASS' : 'FAIL'}</span>
+          <span class="item-name">${key}</span>
+        </div>
+      `;
+    }
+  } else {
+    checksHtml = "<p>No checklist items recorded.</p>";
+  }
+
+  const htmlContent = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Service Check Report - ${check.vehicle_id || "Vehicle"}</title>
+      <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+      <style>
+        body {
+          font-family: 'Inter', sans-serif;
+          color: #1e293b;
+          margin: 0;
+          padding: 40px;
+          line-height: 1.5;
+          background-color: #ffffff;
+        }
+        .header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          border-bottom: 2px solid #e2e8f0;
+          padding-bottom: 20px;
+          margin-bottom: 30px;
+        }
+        .logo-section h1 {
+          margin: 0;
+          font-size: 24px;
+          font-weight: 800;
+          color: #2563eb;
+          letter-spacing: -0.5px;
+        }
+        .logo-section p {
+          margin: 4px 0 0 0;
+          font-size: 12px;
+          color: #64748b;
+          text-transform: uppercase;
+          font-weight: 600;
+        }
+        .report-title {
+          text-align: right;
+        }
+        .report-title h2 {
+          margin: 0;
+          font-size: 18px;
+          font-weight: 700;
+          color: #0f172a;
+        }
+        .report-title p {
+          margin: 4px 0 0 0;
+          font-size: 12px;
+          color: #64748b;
+        }
+        .meta-grid {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 16px;
+          margin-bottom: 30px;
+          background-color: #f8fafc;
+          padding: 20px;
+          border-radius: 8px;
+          border: 1px solid #e2e8f0;
+        }
+        .meta-item {
+          display: flex;
+          flex-direction: column;
+        }
+        .meta-label {
+          font-size: 11px;
+          text-transform: uppercase;
+          font-weight: 600;
+          color: #64748b;
+          margin-bottom: 4px;
+        }
+        .meta-value {
+          font-size: 14px;
+          font-weight: 600;
+          color: #0f172a;
+        }
+        .rating-badge {
+          display: inline-flex;
+          align-items: center;
+          background-color: #fef9c3;
+          color: #854d0e;
+          padding: 4px 8px;
+          border-radius: 4px;
+          font-weight: 700;
+          font-size: 12px;
+        }
+        .section-title {
+          font-size: 14px;
+          font-weight: 700;
+          text-transform: uppercase;
+          color: #475569;
+          border-bottom: 1px solid #e2e8f0;
+          padding-bottom: 8px;
+          margin-top: 30px;
+          margin-bottom: 16px;
+        }
+        .checklist {
+          display: grid;
+          grid-template-columns: repeat(2, 1fr);
+          gap: 12px;
+        }
+        .checklist-item {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          padding: 8px 12px;
+          background-color: #ffffff;
+          border: 1px solid #f1f5f9;
+          border-radius: 6px;
+        }
+        .status-badge {
+          font-size: 10px;
+          font-weight: 700;
+          padding: 2px 6px;
+          border-radius: 4px;
+          text-transform: uppercase;
+        }
+        .status-badge.pass {
+          background-color: #d1fae5;
+          color: #065f46;
+        }
+        .status-badge.fail {
+          background-color: #fee2e2;
+          color: #991b1b;
+        }
+        .item-name {
+          font-size: 13px;
+          font-weight: 500;
+        }
+        .recommendations {
+          display: flex;
+          flex-direction: column;
+          gap: 8px;
+        }
+        .rec-item {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          font-size: 13px;
+        }
+        .rec-bullet {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+        }
+        .rec-bullet.yes {
+          background-color: #2563eb;
+        }
+        .rec-bullet.no {
+          background-color: #cbd5e1;
+        }
+        .notes-content {
+          font-size: 13px;
+          background-color: #f8fafc;
+          padding: 16px;
+          border-radius: 8px;
+          border: 1px solid #e2e8f0;
+          white-space: pre-wrap;
+          font-family: inherit;
+          margin: 0;
+        }
+        .footer {
+          margin-top: 60px;
+          border-top: 1px solid #e2e8f0;
+          padding-top: 20px;
+          text-align: center;
+          font-size: 11px;
+          color: #94a3b8;
+        }
+        @media print {
+          body {
+            padding: 0;
+          }
+          .no-print {
+            display: none;
+          }
+        }
+        .print-btn-container {
+          display: flex;
+          justify-content: flex-end;
+          margin-bottom: 20px;
+        }
+        .btn-print {
+          background-color: #2563eb;
+          color: white;
+          border: none;
+          padding: 8px 16px;
+          border-radius: 6px;
+          font-size: 13px;
+          font-weight: 600;
+          cursor: pointer;
+          font-family: inherit;
+        }
+        .btn-print:hover {
+          background-color: #1d4ed8;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="print-btn-container no-print">
+        <button class="btn-print" onclick="window.print()">Print / Save as PDF</button>
+      </div>
+      <div class="header">
+        <div class="logo-section">
+          <h1>IZEE TRANSIT SYSTEM</h1>
+          <p>Field Observation Report</p>
+        </div>
+        <div class="report-title">
+          <h2>REPORT DETAILS</h2>
+          <p>ID: ${check.incident_id}</p>
+        </div>
+      </div>
+
+      <div class="meta-grid">
+        <div class="meta-item">
+          <span class="meta-label">Vehicle ID</span>
+          <span class="meta-value">${check.vehicle_id || "N/A"}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Route ID</span>
+          <span class="meta-value">${check.route_id || "N/A"}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Date & Time</span>
+          <span class="meta-value">${check.created_at ? new Date(check.created_at).toLocaleString() : "N/A"}</span>
+        </div>
+        <div class="meta-item">
+          <span class="meta-label">Overall Rating</span>
+          <span class="meta-value">
+            <span class="rating-badge">${check.raw_payload?.rating || 5} / 5 Stars</span>
+          </span>
+        </div>
+      </div>
+
+      <div class="section-title">Quality Checklist</div>
+      <div class="checklist">
+        ${checksHtml}
+      </div>
+
+      <div class="section-title">Recommendations</div>
+      <div class="recommendations">
+        <div class="rec-item">
+          <span class="rec-bullet ${check.raw_payload?.recommend_driver_training ? 'yes' : 'no'}"></span>
+          <span>Recommend Driver Training: <strong>${check.raw_payload?.recommend_driver_training ? 'YES' : 'NO'}</strong></span>
+        </div>
+        <div class="rec-item">
+          <span class="rec-bullet ${check.raw_payload?.recommend_vehicle_maintenance ? 'yes' : 'no'}"></span>
+          <span>Suggest Vehicle Maintenance: <strong>${check.raw_payload?.recommend_vehicle_maintenance ? 'YES' : 'NO'}</strong></span>
+        </div>
+        <div class="rec-item">
+          <span class="rec-bullet ${check.raw_payload?.commend_excellent_service ? 'yes' : 'no'}"></span>
+          <span>Commend for Excellent Service: <strong>${check.raw_payload?.commend_excellent_service ? 'YES' : 'NO'}</strong></span>
+        </div>
+      </div>
+
+      <div class="section-title">Supervisor Notes</div>
+      <pre class="notes-content">${check.details || "No additional observation notes provided."}</pre>
+
+      <div class="footer">
+        © 2026 IZEE Smart Transportation • Confidential Operation Report
+      </div>
+
+      <script>
+        window.onload = function() {
+          setTimeout(function() {
+            window.print();
+          }, 500);
+        }
+      </script>
+    </body>
+    </html>
+  `;
+
+  printWindow.document.open();
+  printWindow.document.write(htmlContent);
+  printWindow.document.close();
+};
+
 function renderLogs() {
   return html`
     <div class="grid two-col">
@@ -1296,6 +2079,26 @@ function renderLogs() {
           ].map(([title, desc, time, size]) => html`
             <div class="report-row"><div class="row-line"><div><strong>${title}</strong><br><span class="meta">${desc}</span></div><button class="btn">Download</button></div><span class="meta">${time} &nbsp; ${size}</span></div>
           `).join("")}
+          
+          ${supervisorServiceChecks.map((check) => {
+            const title = `Service Check - ${check.vehicle_id || "Vehicle"}`;
+            const rating = check.raw_payload?.rating || 5;
+            const desc = `Rating: ${rating}/5. ${check.details || ""}`;
+            const time = check.created_at ? new Date(check.created_at).toLocaleString() : "Recently";
+            const size = `${(new Blob([JSON.stringify(check)]).size / 1024).toFixed(1)} KB`;
+            return html`
+              <div class="report-row">
+                <div class="row-line">
+                  <div>
+                    <strong>${title}</strong><br>
+                    <span class="meta">${desc}</span>
+                  </div>
+                  <button class="btn primary" onclick="downloadServiceCheckFile('${check.incident_id}')">Download File</button>
+                </div>
+                <span class="meta">${time} &nbsp; ${size}</span>
+              </div>
+            `;
+          }).join("")}
         </div>
       </section>
     </div>
@@ -1329,6 +2132,159 @@ const renderers = {
   logs: renderLogs,
 };
 
+function initSurveyMap() {
+  const mapContainer = document.getElementById("survey-map");
+  if (!mapContainer) return;
+
+  if (typeof L === "undefined") {
+    console.error("Leaflet is not loaded.");
+    return;
+  }
+
+  if (surveyMap) {
+    try {
+      surveyMap.remove();
+    } catch (e) {
+      console.error(e);
+    }
+    surveyMap = null;
+  }
+
+  const survey = window.SURVEY_DATA || { hotspots: [] };
+
+  surveyMap = L.map("survey-map").setView([30.0444, 31.2357], 11);
+
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 18,
+    attribution: "© OpenStreetMap contributors"
+  }).addTo(surveyMap);
+
+  survey.hotspots.forEach((trip) => {
+    const lat1 = trip.origin.lat;
+    const lon1 = trip.origin.lon;
+    const lat2 = trip.destination.lat;
+    const lon2 = trip.destination.lon;
+    const originName = trip.origin.name;
+    const destName = trip.destination.name;
+
+    // Draw Origin circle
+    L.circleMarker([lat1, lon1], {
+      radius: 6,
+      fillColor: "#12b76a",
+      color: "#ffffff",
+      weight: 1.5,
+      opacity: 1,
+      fillOpacity: 0.9
+    }).addTo(surveyMap)
+      .bindTooltip(`<b>Start (Origin):</b> ${originName}`, { permanent: false, direction: "top" });
+
+    // Draw Destination circle
+    L.circleMarker([lat2, lon2], {
+      radius: 6,
+      fillColor: "#ef4444",
+      color: "#ffffff",
+      weight: 1.5,
+      opacity: 1,
+      fillOpacity: 0.9
+    }).addTo(surveyMap)
+      .bindTooltip(`<b>End (Destination):</b> ${destName}`, { permanent: false, direction: "top" });
+
+    // Draw polyline flow route
+    const polyline = L.polyline([[lat1, lon1], [lat2, lon2]], {
+      color: "#2f80ed",
+      weight: 2,
+      opacity: 0.4,
+      dashArray: "4, 6"
+    }).addTo(surveyMap);
+
+    polyline.on("mouseover", function(e) {
+      this.setStyle({
+        color: "#8b5cf6",
+        weight: 4,
+        opacity: 0.9,
+        dashArray: null
+      });
+      const popupContent = `
+        <div style="font-family:sans-serif; font-size:12px; line-height:1.4; min-width:160px;">
+          <strong style="color:#8b5cf6; font-size:13px;">Trip Profile</strong><br/>
+          <b>Route:</b> ${originName} ➔ ${destName}<br/>
+          <b>Purpose:</b> ${trip.purpose.charAt(0).toUpperCase() + trip.purpose.slice(1)}<br/>
+          <b>Mode:</b> ${trip.mode}
+        </div>
+      `;
+      L.popup()
+        .setLatLng(e.latlng)
+        .setContent(popupContent)
+        .openOn(surveyMap);
+    });
+
+    polyline.on("mouseout", function(e) {
+      this.setStyle({
+        color: "#2f80ed",
+        weight: 2,
+        opacity: 0.4,
+        dashArray: "4, 6"
+      });
+    });
+
+    // Midpoint arrow for direction
+    const midLat = (lat1 + lat2) / 2;
+    const midLon = (lon1 + lon2) / 2;
+    const dy = lat2 - lat1;
+    const dx = lon2 - lon1;
+    let angle = Math.atan2(dy, dx) * (180 / Math.PI);
+    angle = -angle;
+
+    const arrowIcon = L.divIcon({
+      className: "flow-arrow-icon",
+      html: `<div style="transform: rotate(${angle}deg); color:#2f80ed; font-size:14px; font-weight:bold; pointer-events:none; opacity:0.8;">➔</div>`,
+      iconSize: [16, 16],
+      iconAnchor: [8, 8]
+    });
+
+    L.marker([midLat, midLon], { icon: arrowIcon }).addTo(surveyMap);
+  });
+}
+
+function initLiveMap() {
+  const container = document.getElementById("live-map");
+  if (!container || typeof L === "undefined") return;
+
+  if (liveMap) {
+    try { liveMap.remove(); } catch (_) { /* map was already detached */ }
+    liveMap = null;
+  }
+
+  liveMap = L.map(container, { zoomControl: true }).setView([30.0444, 31.2357], 11.5);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "© OpenStreetMap contributors",
+  }).addTo(liveMap);
+
+  const selectedVehicle = liveVehicles.find(vehicle => vehicle.id === selectedLiveVehicleId);
+  if (!selectedVehicle) return;
+
+  const routePoints = selectedVehicleRouteGeometry;
+  if (routePoints.length >= 2) {
+    L.polyline(routePoints, { color: "#05A845", weight: 6, opacity: 0.85 }).addTo(liveMap);
+  }
+
+  const marker = L.marker([selectedVehicle.lat, selectedVehicle.lon], {
+    icon: L.divIcon({
+      className: "live-bus-marker",
+      html: '<span>🚌</span>',
+      iconSize: [38, 38],
+      iconAnchor: [19, 19],
+    }),
+  }).addTo(liveMap);
+  marker.bindTooltip(`${escapeHtml(selectedVehicle.id)} — ${escapeHtml(selectedVehicle.route)}`, { direction: "top" }).openTooltip();
+
+  const bounds = routePoints.length >= 2
+    ? L.latLngBounds([...routePoints, [selectedVehicle.lat, selectedVehicle.lon]])
+    : L.latLngBounds([[selectedVehicle.lat, selectedVehicle.lon]]);
+  liveMap.fitBounds(bounds, { padding: [40, 40], maxZoom: 14 });
+}
+
 function render() {
   if (!renderers[state.view]) {
     state.view = "dashboard";
@@ -1343,20 +2299,14 @@ function render() {
   const messageForm = document.querySelector("#message-form");
   if (messageForm) {
     messageForm.addEventListener("submit", sendControlMessage);
-    messageForm.addEventListener("input", () => {
-      messageDraft = {
-        recipients: messageForm.elements.recipients.value,
-        subject: messageForm.elements.subject.value,
-        body: messageForm.elements.body.value,
-      };
-    });
-    messageForm.addEventListener("change", () => {
-      messageDraft = {
-        recipients: messageForm.elements.recipients.value,
-        subject: messageForm.elements.subject.value,
-        body: messageForm.elements.body.value,
-      };
-    });
+    messageForm.addEventListener("input", syncMessageDraft);
+    messageForm.addEventListener("change", syncMessageDraft);
+  }
+  if (state.view === "analytics" && (state.analyticsTab || "live") === "survey") {
+    setTimeout(initSurveyMap, 100);
+  }
+  if (state.view === "map") {
+    setTimeout(initLiveMap, 0);
   }
 }
 
@@ -1364,7 +2314,7 @@ document.querySelectorAll(".nav-item").forEach((button) => {
   button.addEventListener("click", async () => {
     state.view = button.dataset.view;
     window.history.replaceState(null, "", `?view=${state.view}`);
-    if (state.view === "users") {
+    if (state.view === "users" || state.view === "communications") {
       await loadCcUsers();
     } else if (state.view === "regions") {
       await loadRegionMeta();
@@ -1382,9 +2332,14 @@ function updateClock() {
 setInterval(updateClock, 30000);
 setInterval(loadLiveVehicles, 10000);
 setInterval(loadIncidents, 15000);
+setInterval(loadServiceChecks, 15000);
 setInterval(loadControlMessages, 15000);
+setInterval(loadMessagingStats, 5000);
+setInterval(() => {
+  if (state.view === "communications" || state.view === "users") loadCcUsers().then(render);
+}, 15000);
 updateClock();
-if (state.view === "users") {
+if (state.view === "users" || state.view === "communications") {
   loadCcUsers().then(render);
 } else if (state.view === "regions") {
   Promise.all([loadRegionMeta(), loadCcRegions()]).then(render);
@@ -1393,4 +2348,6 @@ if (state.view === "users") {
 }
 loadLiveVehicles();
 loadIncidents();
+loadServiceChecks();
 loadControlMessages();
+loadMessagingStats();

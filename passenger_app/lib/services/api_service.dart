@@ -103,19 +103,36 @@ class ApiService {
     return get(ApiConfig.profile);
   }
 
+  Future<Map<String, dynamic>> getFavorites() {
+    return get('/passenger/favorites');
+  }
+
+  Future<Map<String, dynamic>> addFavorite(Map<String, dynamic> body) {
+    return post('/passenger/favorites', body: body);
+  }
+
+  Future<Map<String, dynamic>> deleteFavorite(String routeId) {
+    return delete('/passenger/favorites/$routeId');
+  }
+
   Future<Map<String, dynamic>> get(
     String endpoint, {
     Map<String, String>? query,
   }) async {
     final uri = _uri(endpoint, query);
     _logUrl('GET', uri);
-    final response = await _client
-        .get(
-          uri,
-          headers: _headers,
-        )
-        .timeout(const Duration(seconds: 30));
-    return _decode(response);
+    try {
+      final response = await _client
+          .get(
+            uri,
+            headers: _headers,
+          )
+          .timeout(const Duration(seconds: 30));
+      return _decode(response);
+    } catch (e) {
+      print('IZEE API GET ERROR for $uri: $e');
+      rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> post(
@@ -124,14 +141,40 @@ class ApiService {
   }) async {
     final uri = _uri(endpoint);
     _logUrl('POST', uri);
-    final response = await _client
-        .post(
-          uri,
-          headers: _headers,
-          body: jsonEncode(body ?? {}),
-        )
-        .timeout(const Duration(seconds: 30));
-    return _decode(response);
+    try {
+      final response = await _client
+          .post(
+            uri,
+            headers: _headers,
+            body: jsonEncode(body ?? {}),
+          )
+          .timeout(const Duration(seconds: 30));
+      return _decode(response);
+    } catch (e) {
+      print('IZEE API POST ERROR for $uri: $e');
+      rethrow;
+    }
+  }
+
+  Future<Map<String, dynamic>> delete(
+    String endpoint, {
+    Map<String, dynamic>? body,
+  }) async {
+    final uri = _uri(endpoint);
+    _logUrl('DELETE', uri);
+    try {
+      final response = await _client
+          .delete(
+            uri,
+            headers: _headers,
+            body: jsonEncode(body ?? {}),
+          )
+          .timeout(const Duration(seconds: 30));
+      return _decode(response);
+    } catch (e) {
+      print('IZEE API DELETE ERROR for $uri: $e');
+      rethrow;
+    }
   }
 
   Future<Map<String, dynamic>> postRoutingAlgorithm({

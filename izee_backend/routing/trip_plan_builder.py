@@ -215,6 +215,29 @@ def format_route(
             if route_id is not None and route_id not in indexes["valid_route_ids"]:
                 # Discard leg with invalid route_id (synthetic)
                 continue
+
+        ordered_stops = []
+        if mode != "walk" and indexes and "stop_times_by_trip" in indexes:
+            trip_id = leg.get("trip_id")
+            trip_times = indexes["stop_times_by_trip"].get(trip_id, [])
+            if trip_times:
+                from_idx = None
+                to_idx = None
+                for idx, st in enumerate(trip_times):
+                    if st["stop_id"] == from_stop_id:
+                        from_idx = idx
+                    if st["stop_id"] == to_stop_id:
+                        to_idx = idx
+                if from_idx is not None and to_idx is not None:
+                    start_idx, end_idx = min(from_idx, to_idx), max(from_idx, to_idx)
+                    leg_stop_times = trip_times[start_idx : end_idx + 1]
+                    if from_idx > to_idx:
+                        leg_stop_times = list(reversed(leg_stop_times))
+                    for st in leg_stop_times:
+                        s_id = st["stop_id"]
+                        detail = stop_details.get(s_id, {"stop_id": s_id})
+                        ordered_stops.append(build_display_stop(detail))
+
         formatted_leg = {
             "mode": mode,
             "from_stop_id": from_stop_id,
@@ -232,7 +255,8 @@ def format_route(
             "fare_currency": "EGP",
             "geometry": geometry,
             "geometry_source": geometry_source,
-            "eta_adjusted": leg.get("eta_adjusted", False)
+            "eta_adjusted": leg.get("eta_adjusted", False),
+            "ordered_stops": ordered_stops
         }
 
         if leg.get("eta_segments"):
@@ -253,6 +277,44 @@ def format_route(
     # If no valid legs remain, indicate that this alternative should be omitted
     if not legs:
         return None
+
+    navigation_steps = []
+    for leg in legs:
+        leg_mode = leg["mode"]
+        leg_from = leg["from_stop"]
+        leg_to = leg["to_stop"]
+        if leg_mode == "walk":
+            dist = leg.get("distance_meters") or 0
+            dist_str = f" ({dist:.0f}m)" if dist > 0 else ""
+            navigation_steps.append({
+                "instruction": f"Walk to {leg_to.get('name', 'stop')}{dist_str}",
+                "type": "walk",
+                "target_stop": leg_to,
+                "distance_meters": dist
+            })
+        else:
+            route_label = leg.get("route_label") or leg.get("route_id") or "Transit"
+            navigation_steps.append({
+                "instruction": f"Board {route_label} at {leg_from.get('name', 'stop')}",
+                "type": "board",
+                "target_stop": leg_from,
+                "route_label": route_label
+            })
+            ride_stops = leg.get("ordered_stops", [])
+            ride_count = len(ride_stops) - 1 if len(ride_stops) > 1 else 1
+            navigation_steps.append({
+                "instruction": f"Ride for {ride_count} stop{'s' if ride_count > 1 else ''}",
+                "type": "ride",
+                "target_stop": leg_to,
+                "stop_count": ride_count,
+                "stops": ride_stops
+            })
+            navigation_steps.append({
+                "instruction": f"Get off at {leg_to.get('name', 'stop')}",
+                "type": "alight",
+                "target_stop": leg_to
+            })
+
     route_output = {
         "fare": path_fare,
         "trip_id": None,
@@ -274,7 +336,8 @@ def format_route(
         "transfer_count": path_stats["transfer_count"],
         "total_walking_time": path_stats["walking_time"],
         "total_waiting_time": path_stats["waiting_time"],
-        "legs": legs
+        "legs": legs,
+        "navigation_steps": navigation_steps
     }
 
     if raw_result.get("fallback_used"):

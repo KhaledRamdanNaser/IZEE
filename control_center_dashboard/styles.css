@@ -441,6 +441,34 @@ button {
   background-size: 46px 46px;
 }
 
+.leaflet-live-map {
+  width: 100%;
+  height: 610px;
+  z-index: 1;
+}
+
+.map-selection {
+  position: absolute;
+  z-index: 2;
+  top: 14px;
+  left: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100% - 28px);
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, .95);
+  box-shadow: var(--shadow);
+}
+
+.map-selection span, .map-selection-muted { color: var(--text-muted); font-size: 13px; }
+.map-selection button { border: 0; background: transparent; cursor: pointer; font-size: 22px; line-height: 1; }
+.live-bus-marker { background: transparent; border: 0; }
+.live-bus-marker span { display: grid; place-items: center; width: 38px; height: 38px; border-radius: 50%; background: var(--green); box-shadow: var(--shadow); font-size: 21px; }
+.vehicle-select { width: 100%; text-align: left; background: white; cursor: pointer; font: inherit; }
+.vehicle-select.is-selected { border-color: var(--green); background: var(--green-soft); }
+
 .map-marker {
   position: absolute;
   display: grid;
@@ -835,4 +863,39 @@ button {
   .span-2 {
     grid-column: span 1;
   }
+}
+
+/* Cairo Travel Survey Styles */
+.progress-bar-container {
+  display: grid;
+  grid-template-columns: 120px 1fr 50px;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.progress-bar-bg {
+  height: 8px;
+  background: #e5e7eb;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.progress-bar-fill {
+  height: 100%;
+  background: var(--green);
+  border-radius: 4px;
+}
+.mode-label, .demog-label {
+  font-weight: 600;
+  font-size: 13px;
+  text-transform: capitalize;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mode-pct, .demog-pct {
+  text-align: right;
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text);
 }

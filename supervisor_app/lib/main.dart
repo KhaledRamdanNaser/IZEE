@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
@@ -40,7 +41,8 @@ class LiveVehicleRepository {
 
   final http.Client _client;
 
-  Future<List<SupervisorVehicle>> fetchLiveVehicles() async {
+  Future<List<SupervisorVehicle>> fetchLiveVehicles(
+      {bool includeUnavailable = false}) async {
     final uri = Uri.parse('${ApiConfig.baseUrl}/vehicles/live').replace(
       queryParameters: const {'limit': '100'},
     );
@@ -54,6 +56,9 @@ class LiveVehicleRepository {
     final rows = (decoded['vehicles'] as List<dynamic>?) ?? const [];
     return rows
         .whereType<Map<String, dynamic>>()
+        .where((row) =>
+            includeUnavailable ||
+            row['status']?.toString().toLowerCase() != 'unavailable')
         .map(SupervisorVehicle.fromApi)
         .toList(growable: false);
   }
@@ -80,7 +85,7 @@ class LiveVehiclesBuilder extends StatefulWidget {
 class _LiveVehiclesBuilderState extends State<LiveVehiclesBuilder> {
   final LiveVehicleRepository _repository = LiveVehicleRepository();
   Timer? _timer;
-  List<SupervisorVehicle> _vehicles = vehicles;
+  List<SupervisorVehicle> _vehicles = [];
   String? _error;
   bool _loading = true;
 
@@ -96,8 +101,8 @@ class _LiveVehiclesBuilderState extends State<LiveVehiclesBuilder> {
       final liveVehicles = await _repository.fetchLiveVehicles();
       if (!mounted) return;
       setState(() {
-        _vehicles = liveVehicles.isEmpty ? vehicles : liveVehicles;
-        _error = liveVehicles.isEmpty ? 'No live vehicle rows yet' : null;
+        _vehicles = liveVehicles;
+        _error = null;
         _loading = false;
       });
     } catch (error) {
@@ -376,11 +381,436 @@ class _SupervisorHomeScreenState extends State<SupervisorHomeScreen> {
   List<dynamic> _regions = [];
   bool _loadingRegions = true;
   String? _regionsError;
+  List<dynamic> _incidents = [];
+  bool _loadingIncidents = true;
+  String? _incidentsError;
+  Timer? _incidentsTimer;
+  WebSocket? _messagePresenceSocket;
+  Timer? _messagePresencePingTimer;
 
   @override
   void initState() {
     super.initState();
     _fetchRegions();
+    _fetchIncidents();
+    _connectMessagePresence();
+    _incidentsTimer = Timer.periodic(const Duration(seconds: 10), (_) {
+      _fetchIncidents();
+    });
+  }
+
+  @override
+  void dispose() {
+    _incidentsTimer?.cancel();
+    _messagePresencePingTimer?.cancel();
+    _messagePresenceSocket?.close();
+    super.dispose();
+  }
+
+  Future<void> _connectMessagePresence() async {
+    try {
+      final wsBase = ApiConfig.baseUrl.replaceFirst(RegExp(r'^http'), 'ws');
+      _messagePresenceSocket = await WebSocket.connect(
+              '$wsBase/ws/messages?user_type=supervisor&user_id=${Uri.encodeQueryComponent(widget.supervisorId)}')
+          .timeout(const Duration(seconds: 5));
+      _messagePresencePingTimer = Timer.periodic(const Duration(seconds: 15), (_) {
+        _messagePresenceSocket?.add('ping');
+      });
+    } catch (_) {
+      // Presence is optional; the supervisor dashboard remains usable.
+    }
+  }
+
+
+  Future<void> _fetchIncidents() async {
+    try {
+      final res = await http
+          .get(Uri.parse('${ApiConfig.baseUrl}/incidents?scope=supervisor'));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final list = data['incidents'] as List<dynamic>? ?? [];
+        if (!mounted) return;
+
+        // Check for brand new incidents to trigger in-app notification SnackBar
+        final oldIds =
+            _incidents.map((e) => e['incident_id']?.toString()).toSet();
+        bool showNotification = false;
+        dynamic brandNewIncident;
+        for (var inc in list) {
+          final id = inc['incident_id']?.toString();
+          final status = inc['status']?.toString() ?? 'new';
+          if (id != null && !oldIds.contains(id) && status == 'new') {
+            showNotification = true;
+            brandNewIncident = inc;
+            break;
+          }
+        }
+
+        if (showNotification && _incidents.isNotEmpty) {
+          final category = brandNewIncident['category'] ?? 'Incident';
+          final details = brandNewIncident['details'] ?? '';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('NEW INCIDENT: $category - $details'),
+              backgroundColor: danger,
+              duration: const Duration(seconds: 5),
+              action: SnackBarAction(
+                label: 'VIEW',
+                textColor: Colors.white,
+                onPressed: () {
+                  Navigator.of(context)
+                      .push(
+                        MaterialPageRoute(
+                          builder: (_) => SupervisorAlertsScreen(
+                            supervisorId: widget.supervisorId,
+                          ),
+                        ),
+                      )
+                      .then((_) => _fetchIncidents());
+                },
+              ),
+            ),
+          );
+        }
+
+        setState(() {
+          _incidents = list;
+          _incidentsError = null;
+          _loadingIncidents = false;
+        });
+      } else {
+        debugPrint('Failed to load incidents. Status: ${res.statusCode}');
+        if (!mounted) return;
+        setState(() {
+          _incidentsError = 'Alerts unavailable';
+          _loadingIncidents = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Technical error loading incidents: $e');
+      if (!mounted) return;
+      setState(() {
+        _incidentsError = 'Alerts unavailable';
+        _loadingIncidents = false;
+      });
+    }
+  }
+
+  Future<void> _updateIncident(String incidentId,
+      {String? status,
+      bool? transmittedToControl,
+      String? replacementVehicleId,
+      bool? speedUp}) async {
+    try {
+      final body = <String, dynamic>{};
+      if (status != null) body['status'] = status;
+      if (transmittedToControl != null)
+        body['transmitted_to_control'] = transmittedToControl;
+      if (replacementVehicleId != null)
+        body['replacement_vehicle_id'] = replacementVehicleId;
+      if (speedUp != null) body['speed_up'] = speedUp;
+
+      final res = await http.post(
+        Uri.parse('${ApiConfig.baseUrl}/incidents/$incidentId/action'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      );
+
+      if (res.statusCode == 200) {
+        await _fetchIncidents();
+      } else {
+        debugPrint('Failed to update incident. Status: ${res.statusCode}');
+      }
+    } catch (e) {
+      debugPrint('Technical error updating incident: $e');
+    }
+  }
+
+  void _showReplaceVehicleDialog(
+      BuildContext context, dynamic inc, List<SupervisorVehicle> vehicles) {
+    String? selectedVehicle;
+    final brokenVehicle = inc['vehicle_id']?.toString() ?? 'Unknown';
+    final availableVehicles = vehicles
+        .map((v) => v.id)
+        .where((id) => id != brokenVehicle && id != 'Unknown vehicle')
+        .toSet()
+        .toList();
+
+    if (availableVehicles.isEmpty) {
+      availableVehicles
+          .addAll(['BUS-001', 'BUS-002', 'BUS-004', 'V-001', 'V-002', 'V-003']);
+    }
+
+    selectedVehicle = availableVehicles.first;
+
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16)),
+              title: Row(
+                children: [
+                  const Icon(Icons.swap_horiz, color: green, size: 28),
+                  const SizedBox(width: 8),
+                  const Text('Replace Vehicle',
+                      style: TextStyle(fontWeight: FontWeight.w900)),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Broken Vehicle: $brokenVehicle',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w800, color: danger),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Select backup vehicle to deploy:',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<String>(
+                    value: selectedVehicle,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                    items: availableVehicles
+                        .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                        .toList(),
+                    onChanged: (val) {
+                      if (val != null) {
+                        setDialogState(() => selectedVehicle = val);
+                      }
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    Navigator.pop(context); // Close ReplaceVehicleDialog
+                    Navigator.pop(context); // Close Incident Detail Dialog
+                    await _updateIncident(
+                      inc['incident_id']?.toString() ?? '',
+                      status: 'resolved',
+                      replacementVehicleId: selectedVehicle,
+                    );
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                              'Vehicle $brokenVehicle replaced with $selectedVehicle. Incident resolved.'),
+                          backgroundColor: green,
+                        ),
+                      );
+                    }
+                  },
+                  style: FilledButton.styleFrom(backgroundColor: green),
+                  child: const Text('Deploy & Resolve'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showIncidentDetailDialog(
+      BuildContext context, dynamic inc, List<SupervisorVehicle> vehicles) {
+    final category = inc['category']?.toString() ?? 'Other';
+    final severity = (inc['severity']?.toString() ?? 'warning').toUpperCase();
+    final status = inc['status']?.toString() ?? 'new';
+    final details = inc['details']?.toString() ?? 'No details provided';
+    final vehicleId = inc['vehicle_id']?.toString() ?? 'N/A';
+    final routeId = inc['route_id']?.toString() ?? 'N/A';
+    final locationLabel = inc['location_label']?.toString() ?? 'N/A';
+    final source = inc['source']?.toString() ?? 'passenger_app';
+    final createdAtStr = inc['created_at']?.toString() ?? '';
+    final transmitted = inc['transmitted_to_control'] == true;
+
+    String formattedTime = createdAtStr;
+    try {
+      if (createdAtStr.isNotEmpty) {
+        final dt = DateTime.parse(createdAtStr).toLocal();
+        formattedTime =
+            '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+            '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+      }
+    } catch (_) {}
+
+    Color severityColor = Colors.orange;
+    if (severity.toLowerCase() == 'critical') {
+      severityColor = danger;
+    } else if (severity.toLowerCase() == 'minor') {
+      severityColor = blue;
+    }
+
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
+            children: [
+              Icon(Icons.report_gmailerrorred_outlined,
+                  color: severityColor, size: 28),
+              const SizedBox(width: 8),
+              const Text('Incident Report',
+                  style: TextStyle(fontWeight: FontWeight.w900)),
+            ],
+          ),
+          content: SizedBox(
+            width: 480,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _detailField('Category', category, isBold: true),
+                  _detailField('Severity', severity,
+                      valueColor: severityColor, isBold: true),
+                  _detailField('Status', status.toUpperCase(),
+                      valueColor: status.toLowerCase() == 'resolved'
+                          ? green
+                          : Colors.orange,
+                      isBold: true),
+                  _detailField('Submitted At', formattedTime),
+                  _detailField('Report Source',
+                      source == 'passenger_app' ? 'Passenger' : 'Driver'),
+                  _detailField('Transmitted to CC', transmitted ? 'YES' : 'NO',
+                      valueColor: transmitted ? green : Colors.grey),
+                  const Divider(height: 24),
+                  _detailField('Location', locationLabel),
+                  _detailField('Vehicle ID', vehicleId),
+                  _detailField('Route ID', routeId),
+                  const Divider(height: 24),
+                  const Text('Details / Description:',
+                      style:
+                          TextStyle(fontWeight: FontWeight.w800, color: muted)),
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                    ),
+                    child: Text(
+                      details,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 14,
+                          color: Color(0xFF1E293B)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+            if (status.toLowerCase() == 'new')
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      status: 'investigating');
+                },
+                style: FilledButton.styleFrom(backgroundColor: Colors.blue),
+                child: const Text('Acknowledge'),
+              ),
+            if (status.toLowerCase() != 'resolved')
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      status: 'resolved');
+                },
+                style: FilledButton.styleFrom(backgroundColor: green),
+                child: const Text('Resolve'),
+              ),
+            if (status.toLowerCase() != 'resolved' &&
+                category.toLowerCase().contains('breakdown'))
+              FilledButton(
+                onPressed: () {
+                  _showReplaceVehicleDialog(context, inc, vehicles);
+                },
+                style: FilledButton.styleFrom(backgroundColor: blue),
+                child: const Text('Replace Vehicle'),
+              ),
+            if (status.toLowerCase() != 'resolved' &&
+                category.toLowerCase().contains('delay'))
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      speedUp: true);
+                },
+                style: FilledButton.styleFrom(backgroundColor: Colors.orange),
+                child: const Text('Speed Up Driver'),
+              ),
+            if (!transmitted)
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      transmittedToControl: true);
+                },
+                style: FilledButton.styleFrom(
+                  backgroundColor: severity.toLowerCase() == 'critical'
+                      ? danger
+                      : Colors.orange,
+                ),
+                child: const Text('Transmit to CC'),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _detailField(String label, String value,
+      {Color? valueColor, bool isBold = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 120,
+            child: Text('$label:',
+                style:
+                    const TextStyle(fontWeight: FontWeight.w700, color: muted)),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(
+                fontWeight: isBold ? FontWeight.w800 : FontWeight.w600,
+                color: valueColor ?? const Color(0xFF1E293B),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _fetchRegions() async {
@@ -433,9 +863,22 @@ class _SupervisorHomeScreenState extends State<SupervisorHomeScreen> {
         subtitle: _getSubtitle(),
         actions: [
           IconButton(
-            onPressed: () {},
+            onPressed: () {
+              Navigator.of(context)
+                  .push(
+                    MaterialPageRoute(
+                      builder: (_) => SupervisorAlertsScreen(
+                        supervisorId: widget.supervisorId,
+                      ),
+                    ),
+                  )
+                  .then((_) => _fetchIncidents());
+            },
             icon: Badge.count(
-                count: 1, child: const Icon(Icons.notifications_none)),
+                count: _incidents
+                    .where((inc) => inc['status'] != 'resolved')
+                    .length,
+                child: const Icon(Icons.notifications_none)),
             color: Colors.white,
           ),
           IconButton(
@@ -448,192 +891,478 @@ class _SupervisorHomeScreenState extends State<SupervisorHomeScreen> {
       ),
       body: RefreshIndicator(
         onRefresh: () async {
-          await _fetchRegions();
+          await Future.wait([
+            _fetchRegions(),
+            _fetchIncidents(),
+          ]);
         },
         child: LiveVehiclesBuilder(
           builder: (context, liveVehicles, liveError, loadingLiveVehicles) {
+            // A route is active whenever at least one live vehicle reports it.
+            // Counting unique route IDs prevents two buses on the same route from
+            // inflating the dashboard number.
+            final activeRouteCount = liveVehicles
+                .where((vehicle) =>
+                    vehicle.status == 'Running' &&
+                    ((vehicle.routeId ?? '').trim().isNotEmpty ||
+                        vehicle.route.trim().isNotEmpty))
+                .map((vehicle) =>
+                    (vehicle.routeId ?? vehicle.route).trim().toLowerCase())
+                .toSet()
+                .length
+                .toString();
             return ListView(
               physics: const AlwaysScrollableScrollPhysics(),
-            padding: const EdgeInsets.all(14),
-            children: [
-              if (liveError != null) ...[
-                LiveDataBanner(
-                    message: liveError, loading: loadingLiveVehicles),
-                const SizedBox(height: 12),
-              ],
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  final compact = constraints.maxWidth < 720;
-                  if (compact) {
-                    return Column(
-                      children: [
-                        const SizedBox(
-                            height: 126,
-                            child: MetricTile(
-                                icon: Icons.location_on_outlined,
-                                value: '8',
-                                label: 'Active Routes',
-                                color: blue)),
-                        const SizedBox(height: 12),
-                        SizedBox(
-                            height: 126,
-                            child: MetricTile(
-                                icon: Icons.directions_bus,
-                                value: '${liveVehicles.length}',
-                                label: 'Vehicles',
-                                color: green)),
-                        const SizedBox(height: 12),
-                        const SizedBox(
-                            height: 126,
-                            child: MetricTile(
-                                icon: Icons.warning_amber_outlined,
-                                value: '3',
-                                label: 'Alerts',
-                                color: danger)),
-                      ],
-                    );
-                  }
-                  return GridView.count(
-                    crossAxisCount: 3,
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    mainAxisSpacing: 12,
-                    crossAxisSpacing: 12,
-                    childAspectRatio: 3.2,
-                    children: [
-                      const MetricTile(
-                          icon: Icons.location_on_outlined,
-                          value: '8',
-                          label: 'Active Routes',
-                          color: blue),
-                      MetricTile(
-                          icon: Icons.directions_bus,
-                          value: '${liveVehicles.length}',
-                          label: 'Vehicles',
-                          color: green),
-                      const MetricTile(
-                          icon: Icons.warning_amber_outlined,
-                          value: '3',
-                          label: 'Alerts',
-                          color: danger),
-                    ],
-                  );
-                },
-              ),
-              const SizedBox(height: 18),
-              const SectionTitle('Quick Actions'),
-              LayoutBuilder(
-                builder: (context, constraints) {
-                  final compact = constraints.maxWidth < 720;
-                  final tiles = [
-                    ActionTile(
-                      icon: Icons.location_on_outlined,
-                      title: 'Live Monitoring',
-                      subtitle: 'Track vehicles',
-                      color: green,
-                      onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                          builder: (_) => const LiveMonitoringScreen())),
-                    ),
-                    ActionTile(
-                      icon: Icons.assignment_ind_outlined,
-                      title: 'Assignments',
-                      subtitle: 'Driver duties',
-                      color: orange,
-                      onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                          builder: (_) => DriverAssignmentsScreen(
-                              supervisorId: widget.supervisorId))),
-                    ),
-                    ActionTile(
-                      icon: Icons.warning_amber_outlined,
-                      title: 'Report Incident',
-                      subtitle: 'Quick report',
-                      color: danger,
-                      onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                          builder: (_) => const ReportIncidentScreen())),
-                    ),
-                    ActionTile(
-                      icon: Icons.trending_up,
-                      title: 'Service Check',
-                      subtitle: 'Log observation',
-                      color: blue,
-                      onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                          builder: (_) => const ServiceObservationScreen())),
-                    ),
-                    ActionTile(
-                      icon: Icons.chat_bubble_outline,
-                      title: 'Control Center',
-                      subtitle: 'Messages',
-                      color: purple,
-                      onTap: () => Navigator.of(context).push(MaterialPageRoute(
-                          builder: (_) => const ControlCenterScreen())),
-                    ),
-                  ];
-                  if (compact) {
-                    return Column(
-                      children: [
-                        for (final tile in tiles) ...[
-                          SizedBox(height: 104, child: tile),
-                          if (tile != tiles.last) const SizedBox(height: 12),
-                        ],
-                      ],
-                    );
-                  }
-                  return GridView.count(
-                    crossAxisCount: 2,
-                    shrinkWrap: true,
-                    physics: const NeverScrollableScrollPhysics(),
-                    mainAxisSpacing: 12,
-                    crossAxisSpacing: 12,
-                    childAspectRatio: 4.6,
-                    children: tiles,
-                  );
-                },
-              ),
-              const SizedBox(height: 18),
-              Row(
-                children: [
-                  const Expanded(child: SectionTitle('Map Overview')),
-                  TextButton(
-                    onPressed: () => Navigator.of(context).push(
-                        MaterialPageRoute(
-                            builder: (_) => const LiveMonitoringScreen())),
-                    child: const Text('View Full Map ->'),
-                  ),
+              padding: const EdgeInsets.all(14),
+              children: [
+                if (liveError != null) ...[
+                  LiveDataBanner(
+                      message: liveError, loading: loadingLiveVehicles),
+                  const SizedBox(height: 12),
                 ],
-              ),
-              SupervisorMapPreview(vehicles: liveVehicles),
-              const SizedBox(height: 18),
-              const SectionTitle('Recent Alerts'),
-              const AlertRow(
-                  icon: Icons.warning_amber_outlined,
-                  title: 'Vehicle V-002 delayed by 15 mins',
-                  time: '5m ago',
-                  color: orange),
-              const AlertRow(
-                  icon: Icons.report_problem_outlined,
-                  title: 'Breakdown reported on Route 89',
-                  time: '12m ago',
-                  color: danger),
-              const AlertRow(
-                  icon: Icons.schedule,
-                  title: 'Peak hours starting soon',
-                  time: '18m ago',
-                  color: blue),
-              const SizedBox(height: 18),
-              const SectionTitle('Monitored Vehicles'),
-              ...liveVehicles
-                  .map((vehicle) => VehicleListRow(vehicle: vehicle)),
-            ],
-          );
-        },
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final compact = constraints.maxWidth < 720;
+                    final alertsCount = _incidents
+                        .where((inc) => inc['status'] != 'resolved')
+                        .length
+                        .toString();
+                    if (compact) {
+                      return Column(
+                        children: [
+                          SizedBox(
+                              height: 126,
+                              child: MetricTile(
+                                  icon: Icons.location_on_outlined,
+                                  value: activeRouteCount,
+                                  label: 'Active Routes',
+                                  color: blue)),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                              height: 126,
+                              child: MetricTile(
+                                  icon: Icons.directions_bus,
+                                  value: '${liveVehicles.length}',
+                                  label: 'Vehicles',
+                                  color: green)),
+                          const SizedBox(height: 12),
+                          SizedBox(
+                              height: 126,
+                              child: GestureDetector(
+                                onTap: () {
+                                  Navigator.of(context)
+                                      .push(
+                                        MaterialPageRoute(
+                                          builder: (_) =>
+                                              SupervisorAlertsScreen(
+                                            supervisorId: widget.supervisorId,
+                                          ),
+                                        ),
+                                      )
+                                      .then((_) => _fetchIncidents());
+                                },
+                                child: MetricTile(
+                                    icon: Icons.warning_amber_outlined,
+                                    value: alertsCount,
+                                    label: 'Alerts',
+                                    color: danger),
+                              )),
+                        ],
+                      );
+                    }
+                    return GridView.count(
+                      crossAxisCount: 3,
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      mainAxisSpacing: 12,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 3.2,
+                      children: [
+                        MetricTile(
+                            icon: Icons.location_on_outlined,
+                            value: activeRouteCount,
+                            label: 'Active Routes',
+                            color: blue),
+                        MetricTile(
+                            icon: Icons.directions_bus,
+                            value: '${liveVehicles.length}',
+                            label: 'Vehicles',
+                            color: green),
+                        GestureDetector(
+                          onTap: () {
+                            Navigator.of(context)
+                                .push(
+                                  MaterialPageRoute(
+                                    builder: (_) => SupervisorAlertsScreen(
+                                      supervisorId: widget.supervisorId,
+                                    ),
+                                  ),
+                                )
+                                .then((_) => _fetchIncidents());
+                          },
+                          child: MetricTile(
+                              icon: Icons.warning_amber_outlined,
+                              value: alertsCount,
+                              label: 'Alerts',
+                              color: danger),
+                        ),
+                      ],
+                    );
+                  },
+                ),
+                const SizedBox(height: 18),
+                const SectionTitle('Quick Actions'),
+                LayoutBuilder(
+                  builder: (context, constraints) {
+                    final compact = constraints.maxWidth < 720;
+                    final tiles = [
+                      ActionTile(
+                        icon: Icons.location_on_outlined,
+                        title: 'Live Monitoring',
+                        subtitle: 'Track vehicles',
+                        color: green,
+                        onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                                builder: (_) => LiveMonitoringScreen(
+                                    supervisorId: widget.supervisorId))),
+                      ),
+                      ActionTile(
+                        icon: Icons.assignment_ind_outlined,
+                        title: 'Assignments',
+                        subtitle: 'Driver duties',
+                        color: orange,
+                        onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                                builder: (_) => DriverAssignmentsScreen(
+                                    supervisorId: widget.supervisorId))),
+                      ),
+                      ActionTile(
+                        icon: Icons.warning_amber_outlined,
+                        title: 'Report Incident',
+                        subtitle: 'Quick report',
+                        color: danger,
+                        onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                                builder: (_) => const ReportIncidentScreen())),
+                      ),
+                      ActionTile(
+                        icon: Icons.trending_up,
+                        title: 'Service Check',
+                        subtitle: 'Log observation',
+                        color: blue,
+                        onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                                builder: (_) =>
+                                    const ServiceObservationScreen())),
+                      ),
+                      ActionTile(
+                        icon: Icons.chat_bubble_outline,
+                        title: 'Control Center',
+                        subtitle: 'Messages',
+                        color: purple,
+                        onTap: () => Navigator.of(context).push(
+                            MaterialPageRoute(
+                                builder: (_) => ControlCenterScreen(supervisorId: widget.supervisorId))),
+                      ),
+                    ];
+                    if (compact) {
+                      return Column(
+                        children: [
+                          for (final tile in tiles) ...[
+                            SizedBox(height: 104, child: tile),
+                            if (tile != tiles.last) const SizedBox(height: 12),
+                          ],
+                        ],
+                      );
+                    }
+                    return GridView.count(
+                      crossAxisCount: 2,
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      mainAxisSpacing: 12,
+                      crossAxisSpacing: 12,
+                      childAspectRatio: 4.6,
+                      children: tiles,
+                    );
+                  },
+                ),
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    const Expanded(child: SectionTitle('Map Overview')),
+                    TextButton(
+                      onPressed: () => Navigator.of(context).push(
+                          MaterialPageRoute(
+                              builder: (_) => LiveMonitoringScreen(
+                                  supervisorId: widget.supervisorId))),
+                      child: const Text('View Full Map ->'),
+                    ),
+                  ],
+                ),
+                SupervisorMapPreview(vehicles: liveVehicles),
+                const SizedBox(height: 18),
+                const SectionTitle('Recent Alerts'),
+                if (_loadingIncidents)
+                  const Center(
+                    child: Padding(
+                      padding: EdgeInsets.symmetric(vertical: 12),
+                      child: CircularProgressIndicator(),
+                    ),
+                  )
+                else if (_incidentsError != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 12),
+                    child: Text(_incidentsError!,
+                        style: const TextStyle(color: muted)),
+                  )
+                else if (_incidents.isEmpty)
+                  const AlertRow(
+                    icon: Icons.check_circle_outline,
+                    title: 'No recent incident alerts reported',
+                    time: 'Just now',
+                    color: green,
+                  )
+                else
+                  ..._incidents.map((inc) {
+                    final category = inc['category']?.toString() ?? 'Other';
+                    final severity = inc['severity']?.toString() ?? 'warning';
+                    final details = inc['details']?.toString() ?? '';
+                    final createdAtStr = inc['created_at']?.toString() ?? '';
+
+                    String displayTime = 'Just now';
+                    try {
+                      if (createdAtStr.isNotEmpty) {
+                        final dt = DateTime.parse(createdAtStr);
+                        final diff = DateTime.now().toUtc().difference(dt);
+                        if (diff.inMinutes < 1) {
+                          displayTime = 'Just now';
+                        } else if (diff.inMinutes < 60) {
+                          displayTime = '${diff.inMinutes}m ago';
+                        } else if (diff.inHours < 24) {
+                          displayTime = '${diff.inHours}h ago';
+                        } else {
+                          displayTime = '${diff.inDays}d ago';
+                        }
+                      }
+                    } catch (e) {
+                      displayTime = 'Recent';
+                    }
+
+                    IconData alertIcon = Icons.warning_amber_outlined;
+                    Color alertColor = orange;
+                    if (category.toLowerCase().contains('accident') ||
+                        category.toLowerCase().contains('breakdown')) {
+                      alertIcon = Icons.report_problem_outlined;
+                    } else if (category.toLowerCase().contains('delay')) {
+                      alertIcon = Icons.schedule;
+                    } else if (category.toLowerCase().contains('crowding')) {
+                      alertIcon = Icons.people_outline;
+                    } else if (category.toLowerCase().contains('driver')) {
+                      alertIcon = Icons.person_off_outlined;
+                    }
+
+                    if (severity.toLowerCase() == 'critical') {
+                      alertColor = danger;
+                    } else if (severity.toLowerCase() == 'minor') {
+                      alertColor = blue;
+                    }
+
+                    return GestureDetector(
+                      onTap: () {
+                        _showIncidentDetailDialog(context, inc, liveVehicles);
+                      },
+                      child: AlertRow(
+                        icon: alertIcon,
+                        title: '$category: $details',
+                        time: displayTime,
+                        color: alertColor,
+                      ),
+                    );
+                  }),
+                const SizedBox(height: 18),
+                const SectionTitle('Monitored Vehicles'),
+                ...liveVehicles
+                    .map((vehicle) => VehicleListRow(vehicle: vehicle)),
+              ],
+            );
+          },
+        ),
       ),
-    ),
-  );
-}
+    );
+  }
 }
 
-class LiveMonitoringScreen extends StatelessWidget {
-  const LiveMonitoringScreen({super.key});
+class LiveMonitoringScreen extends StatefulWidget {
+  const LiveMonitoringScreen({super.key, required this.supervisorId});
+
+  final String supervisorId;
+
+  @override
+  State<LiveMonitoringScreen> createState() => _LiveMonitoringScreenState();
+}
+
+class _LiveMonitoringScreenState extends State<LiveMonitoringScreen> {
+  String _selectedView = 'all';
+  List<dynamic> _routes = [];
+  bool _loadingRoutes = true;
+  String? _routesError;
+
+  String? _selectedVehicleId;
+  List<LatLng> _routePoints = [];
+  List<SupervisorRouteStop> _routeStops = [];
+  bool _loadingRoute = false;
+  String? _routeLoadError;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchRoutes();
+  }
+
+  Future<void> _fetchRoutes() async {
+    try {
+      final res = await http.get(Uri.parse(
+          '${ApiConfig.baseUrl}/supervisor/${widget.supervisorId}/routes'));
+      if (res.statusCode == 200) {
+        setState(() {
+          _routes = jsonDecode(res.body) as List<dynamic>;
+          _routesError = null;
+          _loadingRoutes = false;
+        });
+      } else {
+        debugPrint('Failed to load routes. Status: ${res.statusCode}');
+        setState(() {
+          _routesError = 'Failed to load routes';
+          _loadingRoutes = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Technical error loading routes: $e');
+      setState(() {
+        _routesError = 'Failed to load routes';
+        _loadingRoutes = false;
+      });
+    }
+  }
+
+  Future<void> _selectVehicle(String vehicleId, String? routeId) async {
+    setState(() {
+      _selectedVehicleId = vehicleId;
+      _routePoints = [];
+      _routeStops = [];
+      _loadingRoute = true;
+      _routeLoadError = null;
+    });
+
+    try {
+      List<LatLng> points = [];
+
+      // 1. Try fetching from /driver/route-info first
+      try {
+        final res = await http.get(Uri.parse(
+            '${ApiConfig.baseUrl}/driver/route-info?vehicle_id=$vehicleId'));
+        if (res.statusCode == 200) {
+          final decoded = jsonDecode(res.body) as Map<String, dynamic>;
+          final routeJson = decoded['route'] is Map<String, dynamic>
+              ? decoded['route'] as Map<String, dynamic>
+              : decoded;
+          final geometryJson = routeJson['geometry'];
+          if (geometryJson is List) {
+            for (var item in geometryJson) {
+              if (item is Map<String, dynamic>) {
+                final lat = (item['lat'] as num?)?.toDouble();
+                final lon = (item['lon'] as num?)?.toDouble();
+                if (lat != null && lon != null && lat != 0 && lon != 0) {
+                  points.add(LatLng(lat, lon));
+                }
+              }
+            }
+          }
+
+          if (points.isEmpty) {
+            final stopsJson = routeJson['stops'];
+            if (stopsJson is List) {
+              for (var s in stopsJson) {
+                if (s is Map<String, dynamic>) {
+                  final lat = (s['lat'] as num?)?.toDouble();
+                  final lon = (s['lon'] as num?)?.toDouble();
+                  if (lat != null && lon != null) {
+                    points.add(LatLng(lat, lon));
+                  }
+                }
+              }
+            }
+          }
+
+          final stopsJson = routeJson['stops'];
+          if (stopsJson is List) {
+            _routeStops = stopsJson
+                .whereType<Map<String, dynamic>>()
+                .map(SupervisorRouteStop.fromApi)
+                .where((stop) => stop.lat != null && stop.lon != null)
+                .toList(growable: false);
+          }
+        }
+      } catch (e) {
+        debugPrint('Error fetching route-info: $e');
+      }
+
+      // 2. Fall back to /routes/{routeId} if points is empty
+      if (points.isEmpty && routeId != null && routeId.isNotEmpty) {
+        try {
+          final routeRes =
+              await http.get(Uri.parse('${ApiConfig.baseUrl}/routes/$routeId'));
+          if (routeRes.statusCode == 200) {
+            final decodedRoute =
+                jsonDecode(routeRes.body) as Map<String, dynamic>;
+            final legs = decodedRoute['legs'];
+            if (legs is List) {
+              for (var leg in legs) {
+                if (leg is Map<String, dynamic>) {
+                  final legGeom = leg['geometry'];
+                  if (legGeom is List) {
+                    for (var item in legGeom) {
+                      if (item is Map<String, dynamic>) {
+                        final lat = (item['lat'] as num?)?.toDouble();
+                        final lon = (item['lon'] as num?)?.toDouble();
+                        if (lat != null &&
+                            lon != null &&
+                            lat != 0 &&
+                            lon != 0) {
+                          points.add(LatLng(lat, lon));
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint('Error fetching fallback route: $e');
+        }
+      }
+
+      if (!mounted) return;
+      if (points.isEmpty) {
+        setState(() {
+          _routeLoadError = 'Route geometry not available';
+          _loadingRoute = false;
+        });
+      } else {
+        setState(() {
+          _routePoints = points;
+          _loadingRoute = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _routeLoadError = 'Error loading route info';
+        _loadingRoute = false;
+      });
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -652,6 +1381,21 @@ class LiveMonitoringScreen extends StatelessWidget {
       ),
       body: LiveVehiclesBuilder(
         builder: (context, liveVehicles, liveError, loadingLiveVehicles) {
+          // If a vehicle is selected, filter so only that selected vehicle is displayed on the map.
+          // Otherwise, display an empty list of vehicles on the map, satisfying the requirement:
+          // "only if I clicked on a vehicle is it is shown on the map with it's route"
+          final List<SupervisorVehicle> mapVehicles = [];
+          if (_selectedVehicleId != null) {
+            try {
+              final activeSel = liveVehicles.firstWhere(
+                (v) => v.id == _selectedVehicleId,
+              );
+              mapVehicles.add(activeSel);
+            } catch (_) {
+              // Selected vehicle is not in live list or not active
+            }
+          }
+
           return Column(
             children: [
               if (liveError != null)
@@ -661,25 +1405,119 @@ class LiveMonitoringScreen extends StatelessWidget {
                 flex: 7,
                 child: Stack(
                   children: [
-                    Positioned.fill(child: BigMap(vehicles: liveVehicles)),
-                    Positioned(
-                      top: 18,
-                      left: 14,
-                      child: AppCard(
-                        padding: const EdgeInsets.all(12),
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: const [
-                            Text('Status',
-                                style: TextStyle(fontSize: 12, color: muted)),
-                            SizedBox(height: 8),
-                            LegendDot(label: 'Running', color: green),
-                            LegendDot(label: 'Delayed', color: orange),
-                            LegendDot(label: 'Stopped', color: danger),
-                          ],
-                        ),
+                    Positioned.fill(
+                      child: BigMap(
+                        vehicles: mapVehicles,
+                        routePoints: _routePoints,
+                        routeStops: _routeStops,
+                        selectedVehicleId: _selectedVehicleId,
                       ),
                     ),
+                    if (_selectedVehicleId != null) ...[
+                      // Floating tracking card with deselect button
+                      Positioned(
+                        top: 18,
+                        left: 14,
+                        right: 80,
+                        child: AppCard(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 10),
+                          child: Row(
+                            children: [
+                              ...(() {
+                                final selected = liveVehicles.firstWhere(
+                                  (v) => v.id == _selectedVehicleId,
+                                  orElse: () => SupervisorVehicle(
+                                    _selectedVehicleId!,
+                                    'Unknown route',
+                                    'Unavailable',
+                                    'N/A',
+                                    Colors.grey,
+                                  ),
+                                );
+                                return [
+                                  RoundIcon(
+                                    icon: Icons.directions_bus,
+                                    size: 32,
+                                    iconSize: 16,
+                                    color: selected.color,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment:
+                                          CrossAxisAlignment.start,
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(
+                                          selected.id,
+                                          style: const TextStyle(
+                                              fontWeight: FontWeight.w800,
+                                              fontSize: 13),
+                                        ),
+                                        Text(
+                                          _routeLoadError ?? selected.route,
+                                          style: TextStyle(
+                                            color: _routeLoadError != null
+                                                ? danger
+                                                : muted,
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                          ),
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  if (_loadingRoute)
+                                    const SizedBox(
+                                      width: 14,
+                                      height: 14,
+                                      child: CircularProgressIndicator(
+                                          strokeWidth: 2, color: green),
+                                    )
+                                  else
+                                    IconButton(
+                                      constraints: const BoxConstraints(),
+                                      padding: EdgeInsets.zero,
+                                      icon: const Icon(Icons.close,
+                                          size: 18, color: Colors.grey),
+                                      onPressed: () {
+                                        setState(() {
+                                          _selectedVehicleId = null;
+                                          _routePoints = [];
+                                          _routeStops = [];
+                                        });
+                                      },
+                                    ),
+                                ];
+                              }()),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ] else ...[
+                      // Status legend card
+                      Positioned(
+                        top: 18,
+                        left: 14,
+                        child: AppCard(
+                          padding: const EdgeInsets.all(12),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: const [
+                              Text('Status',
+                                  style: TextStyle(fontSize: 12, color: muted)),
+                              SizedBox(height: 8),
+                              LegendDot(label: 'Running', color: green),
+                              LegendDot(label: 'Delayed', color: orange),
+                              LegendDot(label: 'Stopped', color: danger),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
                     const Positioned(right: 14, top: 18, child: MapTools()),
                   ],
                 ),
@@ -715,13 +1553,179 @@ class LiveMonitoringScreen extends StatelessWidget {
                               ButtonSegment(
                                   value: 'route', label: Text('By Route')),
                             ],
-                            selected: const {'all'},
-                            onSelectionChanged: (_) {},
+                            selected: {_selectedView},
+                            onSelectionChanged: (val) {
+                              setState(() {
+                                _selectedView = val.first;
+                              });
+                            },
                           ),
                         ],
                       ),
-                      ...liveVehicles
-                          .map((vehicle) => VehicleListRow(vehicle: vehicle)),
+                      const SizedBox(height: 12),
+                      if (liveVehicles.isEmpty &&
+                          !loadingLiveVehicles &&
+                          liveError == null)
+                        Center(
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(vertical: 24),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.directions_bus_filled_outlined,
+                                    size: 40, color: Colors.grey[400]),
+                                const SizedBox(height: 8),
+                                Text(
+                                  'No active vehicles',
+                                  style: TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.w700,
+                                    color: Colors.grey[600],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        )
+                      else if (_selectedView == 'all')
+                        ...liveVehicles.map((vehicle) => VehicleListRow(
+                              vehicle: vehicle,
+                              selected: vehicle.id == _selectedVehicleId,
+                              onTap: () =>
+                                  _selectVehicle(vehicle.id, vehicle.routeId),
+                            ))
+                      else ...[
+                        if (_loadingRoutes)
+                          const Center(
+                            child: Padding(
+                              padding: EdgeInsets.symmetric(vertical: 24),
+                              child: CircularProgressIndicator(),
+                            ),
+                          )
+                        else if (_routesError != null)
+                          Center(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 24),
+                              child: Text(_routesError!,
+                                  style: const TextStyle(
+                                      color: danger,
+                                      fontWeight: FontWeight.w600)),
+                            ),
+                          )
+                        else
+                          ...(() {
+                            final Map<String, String> mergedRoutes = {};
+                            for (var r in _routes) {
+                              final id = r['route_id']?.toString() ?? '';
+                              final name = r['route_name']?.toString() ?? id;
+                              if (id.isNotEmpty) {
+                                mergedRoutes[id] = name;
+                              }
+                            }
+                            for (var v in liveVehicles) {
+                              final id = v.routeId ?? '';
+                              if (id.isNotEmpty &&
+                                  !mergedRoutes.containsKey(id)) {
+                                mergedRoutes[id] =
+                                    v.route.isNotEmpty ? v.route : id;
+                              }
+                            }
+
+                            if (mergedRoutes.isEmpty) {
+                              return [
+                                Center(
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(
+                                        vertical: 24),
+                                    child: Text(
+                                      'No routes found for this region',
+                                      style: TextStyle(
+                                        fontSize: 14,
+                                        fontWeight: FontWeight.w600,
+                                        color: Colors.grey[500],
+                                      ),
+                                    ),
+                                  ),
+                                )
+                              ];
+                            }
+
+                            final List<Widget> routeWidgets = [];
+                            mergedRoutes.forEach((routeId, routeName) {
+                              final routeVehicles = liveVehicles
+                                  .where((v) => v.routeId == routeId)
+                                  .toList();
+
+                              routeWidgets.add(
+                                Padding(
+                                  padding:
+                                      const EdgeInsets.only(top: 14, bottom: 8),
+                                  child: Row(
+                                    children: [
+                                      const Icon(Icons.alt_route,
+                                          color: green, size: 18),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        routeName,
+                                        style: const TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.w800,
+                                          color: Color(0xFF1E293B),
+                                        ),
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Text(
+                                        '(${routeVehicles.length})',
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.w600,
+                                          color: Colors.grey[500],
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
+                              );
+
+                              if (routeVehicles.isEmpty) {
+                                routeWidgets.add(
+                                  AppCard(
+                                    margin: const EdgeInsets.only(bottom: 10),
+                                    padding: const EdgeInsets.symmetric(
+                                        horizontal: 14, vertical: 12),
+                                    child: Row(
+                                      children: [
+                                        Icon(Icons.info_outline,
+                                            size: 16, color: Colors.grey[400]),
+                                        const SizedBox(width: 8),
+                                        Text(
+                                          'No active vehicles for this route',
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w600,
+                                            color: Colors.grey[500],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                );
+                              } else {
+                                routeWidgets.addAll(
+                                  routeVehicles.map((vehicle) => VehicleListRow(
+                                        vehicle: vehicle,
+                                        selected:
+                                            vehicle.id == _selectedVehicleId,
+                                        onTap: () => _selectVehicle(
+                                            vehicle.id, vehicle.routeId),
+                                      )),
+                                );
+                              }
+                            });
+
+                            return routeWidgets;
+                          }()),
+                      ],
                     ],
                   ),
                 ),
@@ -745,6 +1749,86 @@ class _ReportIncidentScreenState extends State<ReportIncidentScreen> {
   String _category = 'Vehicle Breakdown';
   String _severity = 'Medium';
   String _vehicle = 'Select a vehicle...';
+  final TextEditingController _notesController = TextEditingController();
+  List<String> _vehicleOptions = ['Select a vehicle...'];
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVehicles();
+  }
+
+  Future<void> _loadVehicles() async {
+    try {
+      final rows = await LiveVehicleRepository()
+          .fetchLiveVehicles(includeUnavailable: true);
+      if (!mounted) return;
+      setState(() => _vehicleOptions = [
+            'Select a vehicle...',
+            ...rows.map((vehicle) => vehicle.id),
+          ]);
+    } catch (_) {
+      // Vehicle is optional, so the report remains usable if live tracking is offline.
+    }
+  }
+
+  Future<void> _submit() async {
+    setState(() => _submitting = true);
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${ApiConfig.baseUrl}/incidents'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'category': _category,
+              'severity': switch (_severity) {
+                'High' => 'critical',
+                'Low' => 'info',
+                _ => 'warning',
+              },
+              'status': 'new',
+              'vehicle_id': _vehicle == 'Select a vehicle...' ? null : _vehicle,
+              'lat': 30.0444,
+              'lon': 31.2357,
+              'location_label': 'Cairo (supervisor report)',
+              'details': _notesController.text.trim().isEmpty
+                  ? 'Supervisor reported $_category'
+                  : _notesController.text.trim(),
+              'source': 'supervisor_app',
+              'raw_payload': {
+                'report_type': 'incident',
+                'severity_label': _severity
+              },
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('Request failed (${response.statusCode})');
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Incident sent to the control center'),
+        backgroundColor: green,
+      ));
+      Navigator.of(context).pop();
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text(
+            'Could not send the incident. Check the backend connection and try again.'),
+        backgroundColor: danger,
+      ));
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _notesController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -817,8 +1901,7 @@ class _ReportIncidentScreenState extends State<ReportIncidentScreen> {
               value: _vehicle,
               decoration: inputDecoration('', Icons.directions_bus)
                   .copyWith(prefixIcon: null),
-              items: ['Select a vehicle...', 'V-001', 'V-002', 'V-003', 'V-004']
-                  .map((value) {
+              items: _vehicleOptions.map((value) {
                 return DropdownMenuItem(value: value, child: Text(value));
               }).toList(),
               onChanged: (value) =>
@@ -829,6 +1912,8 @@ class _ReportIncidentScreenState extends State<ReportIncidentScreen> {
           FieldLabel(
             label: 'Additional Notes',
             child: TextField(
+              controller: _notesController,
+              maxLength: 500,
               minLines: 5,
               maxLines: 6,
               decoration: inputDecoration(
@@ -838,8 +1923,6 @@ class _ReportIncidentScreenState extends State<ReportIncidentScreen> {
             ),
           ),
           const SizedBox(height: 4),
-          const Text('0/500 characters',
-              style: TextStyle(color: muted, fontSize: 12)),
           const SizedBox(height: 18),
           const FieldTitle('Attach Photo (Optional)'),
           DottedUploadBox(onTap: () {}),
@@ -847,10 +1930,15 @@ class _ReportIncidentScreenState extends State<ReportIncidentScreen> {
           SizedBox(
             height: 52,
             child: FilledButton.icon(
-              onPressed: _category.isEmpty ? null : () {},
+              onPressed: _category.isEmpty || _submitting ? null : _submit,
               style: filledStyle(danger),
-              icon: const Icon(Icons.send_outlined),
-              label: const Text('Submit Report'),
+              icon: _submitting
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2))
+                  : const Icon(Icons.send_outlined),
+              label: Text(_submitting ? 'Sending...' : 'Submit Report'),
             ),
           ),
           const SizedBox(height: 14),
@@ -881,6 +1969,82 @@ class _ServiceObservationScreenState extends State<ServiceObservationScreen> {
     'Passenger Comfort': false,
     'Safety Equipment': false,
   };
+  final TextEditingController _notesController = TextEditingController();
+  List<SupervisorVehicle> _vehicles = [];
+  String? _selectedVehicleId;
+  int _rating = 5;
+  bool _recommendTraining = false;
+  bool _recommendMaintenance = false;
+  bool _commendService = false;
+  bool _submitting = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadVehicles();
+  }
+
+  Future<void> _loadVehicles() async {
+    try {
+      final rows = await LiveVehicleRepository()
+          .fetchLiveVehicles(includeUnavailable: true);
+      if (mounted) setState(() => _vehicles = rows);
+    } catch (_) {
+      // The form still renders and explains that a vehicle is required.
+    }
+  }
+
+  Future<void> _submit() async {
+    if (_selectedVehicleId == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select a vehicle before submitting.')),
+      );
+      return;
+    }
+    setState(() => _submitting = true);
+    try {
+      final response = await http
+          .post(
+            Uri.parse('${ApiConfig.baseUrl}/service-checks'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'vehicle_id': _selectedVehicleId,
+              'rating': _rating,
+              'checks': _checks,
+              'notes': _notesController.text.trim(),
+              'recommend_driver_training': _recommendTraining,
+              'recommend_vehicle_maintenance': _recommendMaintenance,
+              'commend_excellent_service': _commendService,
+              'source': 'supervisor_app',
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw Exception('Request failed (${response.statusCode})');
+      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text('Service check sent to the control center'),
+        backgroundColor: green,
+      ));
+      Navigator.of(context).pop();
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+        content: Text(
+            'Could not send the service check. Check the backend connection and try again.'),
+        backgroundColor: danger,
+      ));
+    } finally {
+      if (mounted) setState(() => _submitting = false);
+    }
+  }
+
+  @override
+  void dispose() {
+    _notesController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -895,19 +2059,21 @@ class _ServiceObservationScreenState extends State<ServiceObservationScreen> {
           FieldLabel(
             label: 'Select Vehicle *',
             child: DropdownButtonFormField<String>(
+              isExpanded: true,
               decoration: inputDecoration('', Icons.directions_bus)
                   .copyWith(prefixIcon: null),
-              value: 'Choose vehicle to observe...',
-              items: [
-                'Choose vehicle to observe...',
-                'V-001 - Route 45',
-                'V-002 - Route 12',
-                'V-004 - Route 89'
-              ]
-                  .map((value) =>
-                      DropdownMenuItem(value: value, child: Text(value)))
+              value: _selectedVehicleId,
+              hint: const Text('Choose vehicle to observe...', overflow: TextOverflow.ellipsis),
+              items: _vehicles
+                  .map((vehicle) => DropdownMenuItem(
+                        value: vehicle.id,
+                        child: Text(
+                          '${vehicle.id} - ${vehicle.route}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ))
                   .toList(),
-              onChanged: (_) {},
+              onChanged: (value) => setState(() => _selectedVehicleId = value),
             ),
           ),
           const SizedBox(height: 18),
@@ -920,22 +2086,25 @@ class _ServiceObservationScreenState extends State<ServiceObservationScreen> {
               )),
           const SizedBox(height: 16),
           const FieldTitle('Overall Service Rating'),
-          const Padding(
+          Padding(
             padding: EdgeInsets.symmetric(vertical: 18),
             child: Row(
               mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(Icons.star, color: Color(0xFFF5C518), size: 30),
-                Icon(Icons.star, color: Color(0xFFF5C518), size: 30),
-                Icon(Icons.star, color: Color(0xFFF5C518), size: 30),
-                Icon(Icons.star, color: Color(0xFFF5C518), size: 30),
-                Icon(Icons.star, color: Color(0xFFF5C518), size: 30),
-              ],
+              children: List.generate(
+                  5,
+                  (index) => IconButton(
+                        onPressed: () => setState(() => _rating = index + 1),
+                        icon: Icon(
+                            index < _rating ? Icons.star : Icons.star_border,
+                            color: const Color(0xFFF5C518),
+                            size: 30),
+                      )),
             ),
           ),
           FieldLabel(
             label: 'Qualitative Feedback & Notes',
             child: TextField(
+              controller: _notesController,
               minLines: 5,
               maxLines: 6,
               decoration: inputDecoration(
@@ -951,16 +2120,19 @@ class _ServiceObservationScreenState extends State<ServiceObservationScreen> {
             child: Column(
               children: [
                 CheckboxListTile(
-                    value: false,
-                    onChanged: (_) {},
+                    value: _recommendTraining,
+                    onChanged: (value) =>
+                        setState(() => _recommendTraining = value ?? false),
                     title: const Text('Recommend driver training')),
                 CheckboxListTile(
-                    value: false,
-                    onChanged: (_) {},
+                    value: _recommendMaintenance,
+                    onChanged: (value) =>
+                        setState(() => _recommendMaintenance = value ?? false),
                     title: const Text('Suggest vehicle maintenance')),
                 CheckboxListTile(
-                    value: false,
-                    onChanged: (_) {},
+                    value: _commendService,
+                    onChanged: (value) =>
+                        setState(() => _commendService = value ?? false),
                     title: const Text('Commend for excellent service')),
               ],
             ),
@@ -969,10 +2141,15 @@ class _ServiceObservationScreenState extends State<ServiceObservationScreen> {
           SizedBox(
             height: 52,
             child: FilledButton.icon(
-                onPressed: () {},
+                onPressed: _submitting ? null : _submit,
                 style: filledStyle(blue),
-                icon: const Icon(Icons.send_outlined),
-                label: const Text('Submit Observation')),
+                icon: _submitting
+                    ? const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.send_outlined),
+                label: Text(_submitting ? 'Sending...' : 'Submit Observation')),
           ),
           const SizedBox(height: 14),
           const Center(
@@ -984,8 +2161,113 @@ class _ServiceObservationScreenState extends State<ServiceObservationScreen> {
   }
 }
 
-class ControlCenterScreen extends StatelessWidget {
-  const ControlCenterScreen({super.key});
+class ControlCenterScreen extends StatefulWidget {
+  final String supervisorId;
+  const ControlCenterScreen({super.key, required this.supervisorId});
+
+  @override
+  State<ControlCenterScreen> createState() => _ControlCenterScreenState();
+}
+
+class _ControlCenterScreenState extends State<ControlCenterScreen> {
+  final TextEditingController _messageController = TextEditingController();
+  List<dynamic> _messages = [];
+  bool _loading = true;
+  bool _sending = false;
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchMessages();
+    _timer = Timer.periodic(const Duration(seconds: 5), (_) => _fetchMessages());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _messageController.dispose();
+    super.dispose();
+  }
+
+
+  Future<void> _fetchMessages() async {
+    try {
+      final res = await http.get(Uri.parse(
+          '${ApiConfig.baseUrl}/messages?recipient_id=${widget.supervisorId}&limit=100'));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final list = data['messages'] as List<dynamic>? ?? [];
+        final sortedList = List.from(list);
+        sortedList.sort((a, b) {
+          final tA = DateTime.parse(a['created_at'].toString());
+          final tB = DateTime.parse(b['created_at'].toString());
+          return tA.compareTo(tB);
+        });
+        if (!mounted) return;
+        setState(() {
+          _messages = sortedList;
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('Error loading chat messages: $e');
+    }
+  }
+
+  Future<void> _sendMessage([String? customText]) async {
+    final text = (customText ?? _messageController.text).trim();
+    if (text.isEmpty) return;
+    if (customText == null) {
+      _messageController.clear();
+    }
+    setState(() => _sending = true);
+
+    try {
+      final response = await http.post(
+        Uri.parse('${ApiConfig.baseUrl}/messages'),
+        headers: const {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'recipient_type': 'control_center',
+          'recipient_id': null,
+          'sender': widget.supervisorId,
+          'subject': 'Supervisor Chat',
+          'body': text,
+          'priority': text.toLowerCase().contains('emergency') ? 'high' : 'normal',
+          'source': 'supervisor_app',
+        }),
+      );
+
+      if (response.statusCode == 200 || response.statusCode == 201) {
+        _fetchMessages();
+      }
+    } catch (e) {
+      debugPrint('Error sending message: $e');
+    } finally {
+      if (mounted) setState(() => _sending = false);
+    }
+  }
+
+  void _useQuickAction(String action) {
+    String text = '';
+    switch (action) {
+      case 'Emergency':
+        text = 'EMERGENCY: Need immediate assistance at my location.';
+        break;
+      case 'Send Report':
+        text = 'I am sending a new operations report.';
+        break;
+      case 'Update Status':
+        text = 'Status Update: Everything is clear on my monitored routes.';
+        break;
+      case 'Request Support':
+        text = 'Requesting support from the nearest control center operator.';
+        break;
+    }
+    if (text.isNotEmpty) {
+      setState(() => _messageController.text = text);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -1000,59 +2282,76 @@ class ControlCenterScreen extends StatelessWidget {
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
             color: Colors.white,
-            child: const Wrap(
+            child: Wrap(
               spacing: 8,
               runSpacing: 8,
               children: [
-                QuickChip(label: 'Emergency', color: danger),
-                QuickChip(label: 'Send Report', color: blue),
-                QuickChip(label: 'Update Status', color: green),
-                QuickChip(label: 'Request Support', color: orange),
+                GestureDetector(
+                  onTap: () => _useQuickAction('Emergency'),
+                  child: const QuickChip(label: 'Emergency', color: danger),
+                ),
+                GestureDetector(
+                  onTap: () => _useQuickAction('Send Report'),
+                  child: const QuickChip(label: 'Send Report', color: blue),
+                ),
+                GestureDetector(
+                  onTap: () => _useQuickAction('Update Status'),
+                  child: const QuickChip(label: 'Update Status', color: green),
+                ),
+                GestureDetector(
+                  onTap: () => _useQuickAction('Request Support'),
+                  child: const QuickChip(label: 'Request Support', color: orange),
+                ),
               ],
             ),
           ),
           Expanded(
-            child: ListView(
-              padding: const EdgeInsets.all(14),
-              children: const [
-                MessageBubble(
-                    sender: 'Control Center',
-                    text:
-                        'Good morning Ahmed. Please monitor Route 45 closely today.',
-                    time: '08:15'),
-                MessageBubble(
-                    sender: 'You',
-                    text: 'Confirmed. I will prioritize Route 45 monitoring.',
-                    time: '08:17',
-                    mine: true),
-                MessageBubble(
-                    sender: 'Control Center',
-                    text:
-                        'Vehicle V-002 is showing delays. Can you investigate?',
-                    time: '09:42'),
-                MessageBubble(
-                    sender: 'You',
-                    text: 'On it. Heading to the location now.',
-                    time: '09:45',
-                    mine: true),
-                MessageBubble(
-                    sender: 'You',
-                    text:
-                        'V-002 experiencing minor traffic congestion. Should normalize in 10 mins.\n\nReport #R-1542',
-                    time: '10:03',
-                    mine: true),
-              ],
-            ),
+            child: _loading
+                ? const Center(child: CircularProgressIndicator())
+                : _messages.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'No messages yet. Send a message to start chatting!',
+                          style: TextStyle(color: muted, fontWeight: FontWeight.w700),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.all(14),
+                        itemCount: _messages.length,
+                        itemBuilder: (context, idx) {
+                          final msg = _messages[idx];
+                          final sender = msg['sender']?.toString() ?? 'Unknown';
+                          final text = msg['body']?.toString() ?? '';
+                          final createdAtStr = msg['created_at']?.toString() ?? '';
+                          
+                          String formattedTime = '';
+                          try {
+                            if (createdAtStr.isNotEmpty) {
+                              final dt = DateTime.parse(createdAtStr).toLocal();
+                              formattedTime = '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+                            }
+                          } catch (_) {}
+
+                          final isMe = msg['source'] == 'supervisor_app' || sender == widget.supervisorId;
+                          
+                          return MessageBubble(
+                            sender: isMe ? 'You' : 'Control Center',
+                            text: text,
+                            time: formattedTime,
+                            mine: isMe,
+                          );
+                        },
+                      ),
           ),
           Container(
             padding: const EdgeInsets.all(12),
             color: Colors.white,
             child: Row(
               children: [
-                IconButton(
-                    onPressed: () {}, icon: const Icon(Icons.attach_file)),
                 Expanded(
                   child: TextField(
+                    controller: _messageController,
+                    onSubmitted: (_) => _sendMessage(),
                     decoration: inputDecoration(
                             'Type your message...', Icons.message_outlined)
                         .copyWith(
@@ -1062,7 +2361,7 @@ class ControlCenterScreen extends StatelessWidget {
                   ),
                 ),
                 IconButton(
-                    onPressed: () {},
+                    onPressed: _sending ? null : () => _sendMessage(),
                     icon: const Icon(Icons.send, color: purple)),
               ],
             ),
@@ -1584,7 +2883,8 @@ class SupervisorMapPreview extends StatelessWidget {
                   ),
                   children: [
                     TileLayer(
-                      urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                      urlTemplate:
+                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                       userAgentPackageName: 'com.example.izee_supervisor',
                     ),
                     MarkerLayer(markers: markers),
@@ -1608,9 +2908,20 @@ class SupervisorMapPreview extends StatelessWidget {
 }
 
 class BigMap extends StatelessWidget {
-  const BigMap({super.key, required this.vehicles});
+  const BigMap({
+    super.key,
+    required this.vehicles,
+    this.routePoints = const [],
+    this.routeStops = const [],
+    this.selectedVehicleId,
+    this.mapController,
+  });
 
   final List<SupervisorVehicle> vehicles;
+  final List<LatLng> routePoints;
+  final List<SupervisorRouteStop> routeStops;
+  final String? selectedVehicleId;
+  final MapController? mapController;
 
   @override
   Widget build(BuildContext context) {
@@ -1632,19 +2943,98 @@ class BigMap extends StatelessWidget {
       );
     }).toList();
 
+    LatLng initialCenter = const LatLng(30.0444, 31.2357);
+    if (vehicles.isNotEmpty) {
+      final first = vehicles.first;
+      final lon = first.lon ?? (31.20 + first.mapX * (31.45 - 31.20));
+      final lat = first.lat ?? (30.18 + first.mapY * (29.95 - 30.18));
+      initialCenter = LatLng(lat, lon);
+    }
+
     return FlutterMap(
-      options: const MapOptions(
-        initialCenter: LatLng(30.0444, 31.2357),
-        initialZoom: 11.5,
+      mapController: mapController,
+      options: MapOptions(
+        initialCenter: initialCenter,
+        initialZoom: vehicles.isNotEmpty ? 13.0 : 11.5,
       ),
       children: [
         TileLayer(
           urlTemplate: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
           userAgentPackageName: 'com.example.izee_supervisor',
         ),
-        MarkerLayer(markers: markers),
+        if (routePoints.length >= 2)
+          PolylineLayer(
+            polylines: _segmentedRoutePolylines(),
+          ),
+        MarkerLayer(markers: [
+          ...routeStops.map((stop) => Marker(
+                point: LatLng(stop.lat!, stop.lon!),
+                width: stop.isCurrent ? 42 : 34,
+                height: stop.isCurrent ? 42 : 34,
+                child: Tooltip(
+                  message: '${stop.sequence}. ${stop.name}',
+                  child: Container(
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: stop.isCompleted
+                          ? const Color(0xFF94A3B8)
+                          : (stop.isCurrent ? orange : Colors.white),
+                      border: Border.all(
+                          color: stop.isCurrent ? orange : green, width: 3),
+                      boxShadow: const [
+                        BoxShadow(color: Color(0x33000000), blurRadius: 5)
+                      ],
+                    ),
+                    child: stop.isCompleted
+                        ? const Icon(Icons.check, color: Colors.white, size: 18)
+                        : Center(
+                            child: Text('${stop.sequence}',
+                                style: TextStyle(
+                                  color: stop.isCurrent ? Colors.white : ink,
+                                  fontSize: 10,
+                                  fontWeight: FontWeight.w900,
+                                ))),
+                  ),
+                ),
+              )),
+          ...markers,
+        ]),
       ],
     );
+  }
+
+  List<Polyline> _segmentedRoutePolylines() {
+    final completed = routeStops.where((stop) => stop.isCompleted).toList();
+    if (completed.isEmpty) {
+      return [
+        Polyline(
+            points: routePoints, strokeWidth: 6, color: green.withOpacity(0.85))
+      ];
+    }
+    final last = completed.last;
+    var splitIndex = 0;
+    var closest = double.infinity;
+    for (var i = 0; i < routePoints.length; i++) {
+      final dLat = routePoints[i].latitude - last.lat!;
+      final dLon = routePoints[i].longitude - last.lon!;
+      final distance = dLat * dLat + dLon * dLon;
+      if (distance < closest) {
+        closest = distance;
+        splitIndex = i;
+      }
+    }
+    return [
+      if (splitIndex >= 1)
+        Polyline(
+            points: routePoints.sublist(0, splitIndex + 1),
+            strokeWidth: 6,
+            color: const Color(0xFF94A3B8).withOpacity(0.85)),
+      if (splitIndex < routePoints.length - 1)
+        Polyline(
+            points: routePoints.sublist(splitIndex),
+            strokeWidth: 6,
+            color: green.withOpacity(0.85)),
+    ];
   }
 }
 
@@ -1736,15 +3126,24 @@ class MapVehicle extends StatelessWidget {
 }
 
 class VehicleListRow extends StatelessWidget {
-  const VehicleListRow({super.key, required this.vehicle});
+  const VehicleListRow({
+    super.key,
+    required this.vehicle,
+    this.selected = false,
+    this.onTap,
+  });
 
   final SupervisorVehicle vehicle;
+  final bool selected;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     return AppCard(
       margin: const EdgeInsets.only(bottom: 10),
       padding: const EdgeInsets.all(14),
+      onTap: onTap,
+      borderColor: selected ? green : null,
       child: Row(
         children: [
           RoundIcon(
@@ -1809,22 +3208,44 @@ class ObservationItem extends StatelessWidget {
           Row(
             children: [
               Expanded(
-                child: OutlinedButton.icon(
+                child: OutlinedButton(
                   onPressed: () => onChanged(true),
                   style: OutlinedButton.styleFrom(
                       backgroundColor: good ? paleGreen : null),
-                  icon: const Icon(Icons.check_circle_outline),
-                  label: const Text('Good'),
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.check_circle_outline, size: 18),
+                      SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          'Good',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
               const SizedBox(width: 8),
               Expanded(
-                child: OutlinedButton.icon(
+                child: OutlinedButton(
                   onPressed: () => onChanged(false),
                   style: OutlinedButton.styleFrom(
                       backgroundColor: !good ? const Color(0xFFFFF1F2) : null),
-                  icon: const Icon(Icons.cancel_outlined),
-                  label: const Text('Poor'),
+                  child: const Row(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.cancel_outlined, size: 18),
+                      SizedBox(width: 6),
+                      Flexible(
+                        child: Text(
+                          'Poor',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
               ),
             ],
@@ -2450,6 +3871,34 @@ String observationSubtitle(String title) {
   };
 }
 
+class SupervisorRouteStop {
+  const SupervisorRouteStop({
+    required this.name,
+    required this.sequence,
+    required this.status,
+    this.lat,
+    this.lon,
+  });
+
+  factory SupervisorRouteStop.fromApi(Map<String, dynamic> data) =>
+      SupervisorRouteStop(
+        name: data['name']?.toString() ?? 'Stop',
+        sequence: (data['sequence'] as num?)?.toInt() ?? 0,
+        status: data['status']?.toString().toLowerCase() ?? 'upcoming',
+        lat: (data['lat'] as num?)?.toDouble(),
+        lon: (data['lon'] as num?)?.toDouble(),
+      );
+
+  final String name;
+  final int sequence;
+  final String status;
+  final double? lat;
+  final double? lon;
+
+  bool get isCompleted => status == 'completed';
+  bool get isCurrent => status == 'next' || status == 'current';
+}
+
 class SupervisorVehicle {
   const SupervisorVehicle(
     this.id,
@@ -2463,6 +3912,7 @@ class SupervisorVehicle {
     this.lon,
     this.mapX = .5,
     this.mapY = .5,
+    this.routeId,
   });
 
   factory SupervisorVehicle.fromApi(Map<String, dynamic> data) {
@@ -2482,9 +3932,15 @@ class SupervisorVehicle {
       _ => green,
     };
 
+    final rId = data['route_id']?.toString();
+    final rName = data['route_name']?.toString() ??
+        data['route_label']?.toString() ??
+        rId ??
+        'Live vehicle';
+
     return SupervisorVehicle(
       id,
-      'Live vehicle',
+      rName,
       status,
       (data['area'] ?? _formatLatLon(latValue, lonValue)).toString(),
       color,
@@ -2494,6 +3950,7 @@ class SupervisorVehicle {
       lon: lonValue,
       mapX: _normalize(lonValue, 31.20, 31.45),
       mapY: _normalize(latValue, 30.18, 29.95),
+      routeId: rId,
     );
   }
 
@@ -2508,6 +3965,7 @@ class SupervisorVehicle {
   final double? lon;
   final double mapX;
   final double mapY;
+  final String? routeId;
 }
 
 const vehicles = [
@@ -2573,14 +4031,16 @@ class _DriverAssignmentsScreenState extends State<DriverAssignmentsScreen> {
       } else {
         debugPrint('Failed to load assignments. Status: ${res.statusCode}');
         setState(() {
-          _error = 'Unable to connect to the server. Please check that the backend is running and try again.';
+          _error =
+              'Unable to connect to the server. Please check that the backend is running and try again.';
           _loading = false;
         });
       }
     } catch (e) {
       debugPrint('Technical error fetching assignments: $e');
       setState(() {
-        _error = 'Unable to connect to the server. Please check that the backend is running and try again.';
+        _error =
+            'Unable to connect to the server. Please check that the backend is running and try again.';
         _loading = false;
       });
     }
@@ -2653,7 +4113,10 @@ class _DriverAssignmentsScreenState extends State<DriverAssignmentsScreen> {
         ],
       ),
     );
-    controller.dispose();
+    // Navigator.pop completes before the dialog's final widget update has
+    // finished. Dispose after that frame so TextField is not rebuilt with an
+    // already-disposed controller.
+    WidgetsBinding.instance.addPostFrameCallback((_) => controller.dispose());
     return result;
   }
 
@@ -2663,7 +4126,7 @@ class _DriverAssignmentsScreenState extends State<DriverAssignmentsScreen> {
       builder: (context) => AlertDialog(
         title: const Text('Delete Assignment'),
         content: const Text(
-            'This will hide the assignment from Supervisor and Driver screens but keep it in the database for audit.'),
+            'This will permanently remove a scheduled or cancelled assignment. Active and completed duties are kept as operational records.'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(context, false),
@@ -2826,7 +4289,8 @@ class _DriverAssignmentsScreenState extends State<DriverAssignmentsScreen> {
                             const Icon(Icons.assignment_outlined,
                                 color: muted, size: 48),
                             const SizedBox(height: 12),
-                            const Text('No assignments found. Create a new assignment.',
+                            const Text(
+                                'No assignments found. Create a new assignment.',
                                 style: TextStyle(color: muted)),
                             const SizedBox(height: 16),
                             ElevatedButton(
@@ -2946,8 +4410,7 @@ class _DriverAssignmentsScreenState extends State<DriverAssignmentsScreen> {
                                           value: 'delete',
                                           child: ListTile(
                                             dense: true,
-                                            leading:
-                                                Icon(Icons.delete_outline),
+                                            leading: Icon(Icons.delete_outline),
                                             title: Text('Delete Assignment'),
                                           ),
                                         ),
@@ -3363,10 +4826,12 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
     try {
       // 1. If editing, use the existing assignment's region.
       //    Otherwise call GET /supervisor/{id}/region to auto-load the supervisor's region.
-      if (widget.assignment != null && widget.assignment!['region_id'] != null) {
+      if (widget.assignment != null &&
+          widget.assignment!['region_id'] != null) {
         _selectedRegion = widget.assignment!['region_id']?.toString();
         debugPrint("SELECTED_REGION_ID (from edit): $_selectedRegion");
-        debugPrint("SUPERVISOR_REGION_RESPONSE: {\"region_id\": \"$_selectedRegion\", \"region_name\": \"$_selectedRegion\"}");
+        debugPrint(
+            "SUPERVISOR_REGION_RESPONSE: {\"region_id\": \"$_selectedRegion\", \"region_name\": \"$_selectedRegion\"}");
       } else {
         final resRegion = await http.get(Uri.parse(
             '${ApiConfig.baseUrl}/supervisor/${widget.supervisorId}/region'));
@@ -3382,14 +4847,17 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
             final list = jsonDecode(resRegions.body) as List<dynamic>;
             if (list.isNotEmpty) {
               _selectedRegion = list.first['region_id']?.toString();
-              debugPrint("SUPERVISOR_REGION_RESPONSE: {\"region_id\": \"$_selectedRegion\", \"region_name\": \"${list.first['region_name']}\"}");
+              debugPrint(
+                  "SUPERVISOR_REGION_RESPONSE: {\"region_id\": \"$_selectedRegion\", \"region_name\": \"${list.first['region_name']}\"}");
             } else {
-              final errMsg = 'Supervisor is not assigned to any region (status: ${resRegion.statusCode})';
+              final errMsg =
+                  'Supervisor is not assigned to any region (status: ${resRegion.statusCode})';
               debugPrint("LOAD_SUPERVISOR_REGION_ERROR: $errMsg");
               throw Exception(errMsg);
             }
           } else {
-            final errMsg = 'Failed to load supervisor region (status: ${resRegion.statusCode})';
+            final errMsg =
+                'Failed to load supervisor region (status: ${resRegion.statusCode})';
             debugPrint("LOAD_SUPERVISOR_REGION_ERROR: $errMsg");
             throw Exception(errMsg);
           }
@@ -3425,9 +4893,13 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
           data = [];
         }
         debugPrint("DRIVERS_PARSED_COUNT: ${data.length}");
-        _drivers = data.map((d) => d['driver_id']?.toString() ?? '').where((id) => id.isNotEmpty).toList();
+        _drivers = data
+            .map((d) => d['driver_id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toList();
       } else {
-        throw Exception('Failed to load region drivers (${resDrivers.statusCode})');
+        throw Exception(
+            'Failed to load region drivers (${resDrivers.statusCode})');
       }
 
       setState(() {
@@ -3458,32 +4930,41 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
 
   Future<void> _fetchRoutesAndVehicles(String? regionId) async {
     final encodedSupervisor = Uri.encodeComponent(widget.supervisorId);
-    final encodedRegion = regionId == null ? null : Uri.encodeComponent(regionId);
+    final encodedRegion =
+        regionId == null ? null : Uri.encodeComponent(regionId);
     final routesUrl = encodedRegion != null
         ? '${ApiConfig.baseUrl}/regions/$encodedRegion/routes?supervisor_id=$encodedSupervisor'
         : '${ApiConfig.baseUrl}/supervisor/$encodedSupervisor/routes';
     final vehiclesUrl = encodedRegion != null
         ? '${ApiConfig.baseUrl}/regions/$encodedRegion/vehicles?supervisor_id=$encodedSupervisor'
         : '${ApiConfig.baseUrl}/supervisor/$encodedSupervisor/vehicles';
-    
+
     debugPrint("SUPERVISOR_REGION_ID: $regionId");
     debugPrint("ROUTES_REQUEST_URL: $routesUrl");
     debugPrint("VEHICLES_REQUEST_URL: $vehiclesUrl");
 
     try {
       final resRoutes = await http.get(Uri.parse(routesUrl));
-      debugPrint("ROUTES_RESPONSE_STATUS: ${resRoutes.statusCode} BODY: ${resRoutes.body}");
+      debugPrint(
+          "ROUTES_RESPONSE_STATUS: ${resRoutes.statusCode} BODY: ${resRoutes.body}");
       if (resRoutes.statusCode == 200) {
         debugPrint("REGION_ROUTES_RESPONSE: ${resRoutes.body}");
         final data = jsonDecode(resRoutes.body) as List<dynamic>;
-        _routes = data.map((r) => r['route_id']?.toString() ?? '').where((id) => id.isNotEmpty).toSet().toList();
-        debugPrint("CREATE_ASSIGNMENT_ROUTE_OPTIONS: count=${_routes.length} routes=$_routes");
+        _routes = data
+            .map((r) => r['route_id']?.toString() ?? '')
+            .where((id) => id.isNotEmpty)
+            .toSet()
+            .toList();
+        debugPrint(
+            "CREATE_ASSIGNMENT_ROUTE_OPTIONS: count=${_routes.length} routes=$_routes");
       } else {
-        throw Exception('Failed to load region routes (${resRoutes.statusCode})');
+        throw Exception(
+            'Failed to load region routes (${resRoutes.statusCode})');
       }
 
       final resVehicles = await http.get(Uri.parse(vehiclesUrl));
-      debugPrint("VEHICLES_RESPONSE_STATUS: ${resVehicles.statusCode} BODY: ${resVehicles.body}");
+      debugPrint(
+          "VEHICLES_RESPONSE_STATUS: ${resVehicles.statusCode} BODY: ${resVehicles.body}");
       if (resVehicles.statusCode == 200) {
         debugPrint("REGION_VEHICLES_RESPONSE: ${resVehicles.body}");
         final data = jsonDecode(resVehicles.body) as List<dynamic>;
@@ -3496,7 +4977,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
             .toSet()
             .toList();
       } else {
-        throw Exception('Failed to load region vehicles (${resVehicles.statusCode})');
+        throw Exception(
+            'Failed to load region vehicles (${resVehicles.statusCode})');
       }
 
       setState(() {
@@ -3531,7 +5013,7 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
 
   Future<void> _save() async {
     if (!_formKey.currentState!.validate()) return;
-    
+
     // Validations
     if (_selectedDriver == null || _selectedDriver!.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -3547,7 +5029,9 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
     }
     if (_selectedRoute == null || _selectedRoute!.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No bus routes assigned to your region. Contact Control Center.')),
+        const SnackBar(
+            content: Text(
+                'No bus routes assigned to your region. Contact Control Center.')),
       );
       return;
     }
@@ -3600,7 +5084,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
     final startTimeClean = startTimeStr.replaceAll(':', '');
 
     final tripId = isEdit
-        ? (widget.assignment!['trip_id']?.toString() ?? 'OP_${routeClean}_${driverClean}_${serviceDateStr}_$startTimeClean')
+        ? (widget.assignment!['trip_id']?.toString() ??
+            'OP_${routeClean}_${driverClean}_${serviceDateStr}_$startTimeClean')
         : 'OP_${routeClean}_${driverClean}_${serviceDateStr}_$startTimeClean';
 
     final status = isEdit
@@ -3653,7 +5138,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
         );
         Navigator.pop(context);
       } else {
-        debugPrint("ASSIGNMENT_ERROR_RESPONSE: status=${response.statusCode} body=${response.body}");
+        debugPrint(
+            "ASSIGNMENT_ERROR_RESPONSE: status=${response.statusCode} body=${response.body}");
         String err = 'Failed to save assignment';
         try {
           err = jsonDecode(response.body)['detail']?.toString() ?? err;
@@ -3677,7 +5163,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
   Widget build(BuildContext context) {
     final isEdit = widget.assignment != null;
 
-    final bool hasNoRegion = _selectedRegion == null || _selectedRegion!.isEmpty;
+    final bool hasNoRegion =
+        _selectedRegion == null || _selectedRegion!.isEmpty;
 
     final List<String> disabledReasons = [];
     if (hasNoRegion) {
@@ -3698,7 +5185,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
 
     final bool isFormValid = disabledReasons.isEmpty;
     if (!isFormValid) {
-      debugPrint("CREATE_ASSIGNMENT_FORM_DISABLED_REASON: ${disabledReasons.join(', ')}");
+      debugPrint(
+          "CREATE_ASSIGNMENT_FORM_DISABLED_REASON: ${disabledReasons.join(', ')}");
     }
 
     return Scaffold(
@@ -3734,7 +5222,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                           children: [
                             Row(
                               children: const [
-                                Icon(Icons.error_outline, color: danger, size: 20),
+                                Icon(Icons.error_outline,
+                                    color: danger, size: 20),
                                 SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
@@ -3764,7 +5253,8 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                       // Region is auto-loaded from the backend — no dropdown shown
                       if (_selectedRegion != null) ...[
                         Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 14, vertical: 10),
                           decoration: BoxDecoration(
                             color: const Color(0xFFF4F6F8),
                             borderRadius: BorderRadius.circular(8),
@@ -3772,14 +5262,17 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                           ),
                           child: Row(
                             children: [
-                              const Icon(Icons.map_outlined, size: 18, color: Color(0xFF6B7280)),
+                              const Icon(Icons.map_outlined,
+                                  size: 18, color: Color(0xFF6B7280)),
                               const SizedBox(width: 8),
                               Text(
                                 'Region: ${_selectedRegion ?? ''}',
-                                style: const TextStyle(fontSize: 14, color: Color(0xFF6B7280)),
+                                style: const TextStyle(
+                                    fontSize: 14, color: Color(0xFF6B7280)),
                               ),
                               const Spacer(),
-                              const Icon(Icons.lock_outline, size: 16, color: Color(0xFF9CA3AF)),
+                              const Icon(Icons.lock_outline,
+                                  size: 16, color: Color(0xFF9CA3AF)),
                             ],
                           ),
                         ),
@@ -3809,7 +5302,9 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                     FieldLabel(
                       label: 'Select Driver *',
                       child: DropdownButtonFormField<String>(
-                        value: (_drivers.isEmpty || hasNoRegion) ? null : _selectedDriver,
+                        value: (_drivers.isEmpty || hasNoRegion)
+                            ? null
+                            : _selectedDriver,
                         decoration: inputDecoration('', Icons.person_outline)
                             .copyWith(prefixIcon: null),
                         items: (_drivers.isEmpty || hasNoRegion)
@@ -3843,7 +5338,9 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                     FieldLabel(
                       label: 'Select Vehicle *',
                       child: DropdownButtonFormField<String>(
-                        value: (_vehicles.isEmpty || hasNoRegion) ? null : _selectedVehicle,
+                        value: (_vehicles.isEmpty || hasNoRegion)
+                            ? null
+                            : _selectedVehicle,
                         decoration: inputDecoration('', Icons.directions_bus)
                             .copyWith(prefixIcon: null),
                         items: (_vehicles.isEmpty || hasNoRegion)
@@ -3882,7 +5379,9 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                     FieldLabel(
                       label: 'Select Route *',
                       child: DropdownButtonFormField<String>(
-                        value: (_routes.isEmpty || hasNoRegion) ? null : _selectedRoute,
+                        value: (_routes.isEmpty || hasNoRegion)
+                            ? null
+                            : _selectedRoute,
                         decoration: inputDecoration('', Icons.route_outlined)
                             .copyWith(prefixIcon: null),
                         items: (_routes.isEmpty || hasNoRegion)
@@ -4051,7 +5550,9 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                             ? const CircularProgressIndicator(
                                 color: Colors.white)
                             : Text(isFormValid
-                                ? (isEdit ? 'Update Assignment' : 'Create Assignment')
+                                ? (isEdit
+                                    ? 'Update Assignment'
+                                    : 'Create Assignment')
                                 : 'Complete region setup first.'),
                       ),
                     ),
@@ -4059,6 +5560,678 @@ class _AssignmentFormScreenState extends State<AssignmentFormScreen> {
                 ),
               ),
             ),
+    );
+  }
+}
+
+class SupervisorAlertsScreen extends StatefulWidget {
+  final String supervisorId;
+  const SupervisorAlertsScreen({super.key, required this.supervisorId});
+
+  @override
+  State<SupervisorAlertsScreen> createState() => _SupervisorAlertsScreenState();
+}
+
+class _SupervisorAlertsScreenState extends State<SupervisorAlertsScreen> {
+  List<dynamic> _incidents = [];
+  bool _loading = true;
+  String? _error;
+  Timer? _timer;
+  int _selectedTab = 0; // 0 = Active, 1 = Resolved
+  String? _selectedSource; // null = All, 'passenger_app' = Passenger, 'driver_app' = Driver
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchIncidents();
+    _timer = Timer.periodic(const Duration(seconds: 10), (_) {
+      _fetchIncidents();
+    });
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _fetchIncidents() async {
+    try {
+      final res = await http
+          .get(Uri.parse('${ApiConfig.baseUrl}/incidents?scope=supervisor'));
+      if (res.statusCode == 200) {
+        final data = jsonDecode(res.body);
+        final list = data['incidents'] as List<dynamic>? ?? [];
+        if (!mounted) return;
+        setState(() {
+          _incidents = list;
+          _error = null;
+          _loading = false;
+        });
+      } else {
+        if (!mounted) return;
+        setState(() {
+          _error = 'Alerts unavailable';
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = 'Alerts unavailable';
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _updateIncident(String incidentId,
+      {String? status,
+      bool? transmittedToControl,
+      String? replacementVehicleId,
+      bool? speedUp}) async {
+    try {
+      final body = <String, dynamic>{};
+      if (status != null) body['status'] = status;
+      if (transmittedToControl != null)
+        body['transmitted_to_control'] = transmittedToControl;
+      if (replacementVehicleId != null)
+        body['replacement_vehicle_id'] = replacementVehicleId;
+      if (speedUp != null) body['speed_up'] = speedUp;
+
+      final res = await http.post(
+        Uri.parse('${ApiConfig.baseUrl}/incidents/$incidentId/action'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(body),
+      );
+
+      if (res.statusCode == 200) {
+        await _fetchIncidents();
+      }
+    } catch (e) {
+      debugPrint('Error updating incident: $e');
+    }
+  }
+
+  void _showReplaceVehicleDialog(
+      BuildContext context, dynamic inc, List<SupervisorVehicle> vehicles) {
+    String? selectedVehicle;
+    final brokenVehicle = inc['vehicle_id']?.toString() ?? 'Unknown';
+    final availableVehicles = vehicles
+        .map((v) => v.id)
+        .where((id) => id != brokenVehicle && id != 'Unknown vehicle')
+        .toSet()
+        .toList();
+
+    if (availableVehicles.isEmpty) {
+      availableVehicles
+          .addAll(['BUS-001', 'BUS-002', 'BUS-004', 'V-001', 'V-002', 'V-003']);
+    }
+
+    selectedVehicle = availableVehicles.first;
+
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(16)),
+              title: Row(
+                children: [
+                  const Icon(Icons.swap_horiz, color: green, size: 28),
+                  const SizedBox(width: 8),
+                  const Text('Replace Vehicle',
+                      style: TextStyle(fontWeight: FontWeight.w900)),
+                ],
+              ),
+              content: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Broken Vehicle: $brokenVehicle',
+                    style: const TextStyle(
+                        fontWeight: FontWeight.w800, color: danger),
+                  ),
+                  const SizedBox(height: 14),
+                  const Text(
+                    'Select backup vehicle to deploy:',
+                    style: TextStyle(fontWeight: FontWeight.w700),
+                  ),
+                  const SizedBox(height: 8),
+                  DropdownButtonFormField<String>(
+                    value: selectedVehicle,
+                    decoration: const InputDecoration(
+                      border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                    ),
+                    items: availableVehicles
+                        .map((v) => DropdownMenuItem(value: v, child: Text(v)))
+                        .toList(),
+                    onChanged: (val) {
+                      if (val != null) {
+                        setDialogState(() => selectedVehicle = val);
+                      }
+                    },
+                  ),
+                ],
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    Navigator.pop(context); // Close ReplaceVehicleDialog
+                    Navigator.pop(context); // Close Incident Detail Dialog
+                    await _updateIncident(
+                      inc['incident_id']?.toString() ?? '',
+                      status: 'resolved',
+                      replacementVehicleId: selectedVehicle,
+                    );
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text(
+                              'Vehicle $brokenVehicle replaced with $selectedVehicle. Incident resolved.'),
+                          backgroundColor: green,
+                        ),
+                      );
+                    }
+                  },
+                  style: FilledButton.styleFrom(backgroundColor: green),
+                  child: const Text('Deploy & Resolve'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showIncidentDetailDialog(
+      BuildContext context, dynamic inc, List<SupervisorVehicle> vehicles) {
+    final category = inc['category']?.toString() ?? 'Other';
+    final severity = (inc['severity']?.toString() ?? 'warning').toUpperCase();
+    final status = inc['status']?.toString() ?? 'new';
+    final details = inc['details']?.toString() ?? 'No details provided';
+    final vehicleId = inc['vehicle_id']?.toString() ?? 'N/A';
+    final routeId = inc['route_id']?.toString() ?? 'N/A';
+    final locationLabel = inc['location_label']?.toString() ?? 'N/A';
+    final source = inc['source']?.toString() ?? 'passenger_app';
+    final createdAtStr = inc['created_at']?.toString() ?? '';
+    final transmitted = inc['transmitted_to_control'] == true;
+
+    String formattedTime = createdAtStr;
+    try {
+      if (createdAtStr.isNotEmpty) {
+        final dt = DateTime.parse(createdAtStr).toLocal();
+        formattedTime =
+            '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')} '
+            '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+      }
+    } catch (_) {}
+
+    Color severityColor = Colors.orange;
+    if (severity.toLowerCase() == 'critical') {
+      severityColor = danger;
+    } else if (severity.toLowerCase() == 'minor') {
+      severityColor = blue;
+    }
+
+    showDialog<void>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: Row(
+            children: [
+              Icon(Icons.report_gmailerrorred_outlined,
+                  color: severityColor, size: 28),
+              const SizedBox(width: 8),
+              const Text('Incident Report',
+                  style: TextStyle(fontWeight: FontWeight.w900)),
+            ],
+          ),
+          content: SizedBox(
+            width: 480,
+            child: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _detailField('Category', category, isBold: true),
+                  _detailField('Severity', severity,
+                      valueColor: severityColor, isBold: true),
+                  _detailField('Status', status.toUpperCase(),
+                      valueColor: status.toLowerCase() == 'resolved'
+                          ? green
+                          : Colors.orange,
+                      isBold: true),
+                  _detailField('Submitted At', formattedTime),
+                  _detailField('Report Source',
+                      source == 'passenger_app' ? 'Passenger' : (source == 'supervisor_app' ? 'Supervisor' : 'Driver')),
+                  _detailField('Transmitted to CC', transmitted ? 'YES' : 'NO',
+                      valueColor: transmitted ? green : Colors.grey),
+                  const Divider(height: 24),
+                  _detailField('Location', locationLabel),
+                  _detailField('Vehicle ID', vehicleId),
+                  _detailField('Route ID', routeId),
+                  const Divider(height: 24),
+                  const Text('Details / Description:',
+                      style:
+                          TextStyle(fontWeight: FontWeight.w800, color: muted)),
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFFE2E8F0)),
+                    ),
+                    child: Text(
+                      details,
+                      style: const TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 14,
+                          color: Color(0xFF1E293B)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Close'),
+            ),
+            if (status.toLowerCase() == 'new')
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      status: 'investigating');
+                },
+                style: FilledButton.styleFrom(backgroundColor: Colors.blue),
+                child: const Text('Acknowledge'),
+              ),
+            if (status.toLowerCase() != 'resolved')
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      status: 'resolved');
+                },
+                style: FilledButton.styleFrom(backgroundColor: green),
+                child: const Text('Resolve'),
+              ),
+            if (status.toLowerCase() != 'resolved' &&
+                category.toLowerCase().contains('breakdown'))
+              FilledButton(
+                onPressed: () {
+                  _showReplaceVehicleDialog(context, inc, vehicles);
+                },
+                style: FilledButton.styleFrom(backgroundColor: blue),
+                child: const Text('Replace Vehicle'),
+              ),
+            if (status.toLowerCase() != 'resolved' &&
+                category.toLowerCase().contains('delay'))
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      speedUp: true);
+                },
+                style: FilledButton.styleFrom(backgroundColor: Colors.orange),
+                child: const Text('Speed Up Driver'),
+              ),
+            if (!transmitted)
+              FilledButton(
+                onPressed: () async {
+                  Navigator.pop(context);
+                  await _updateIncident(inc['incident_id']?.toString() ?? '',
+                      transmittedToControl: true);
+                },
+                style: FilledButton.styleFrom(
+                  backgroundColor: severity.toLowerCase() == 'critical'
+                      ? danger
+                      : Colors.orange,
+                ),
+                child: const Text('Transmit to CC'),
+              ),
+          ],
+        );
+      },
+    );
+  }
+
+  Widget _detailField(String label, String value,
+      {Color? valueColor, bool isBold = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 120,
+            child: Text('$label:',
+                style:
+                    const TextStyle(fontWeight: FontWeight.w700, color: muted)),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(
+                fontWeight: isBold ? FontWeight.w800 : FontWeight.w600,
+                color: valueColor ?? const Color(0xFF1E293B),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sourceFilterChip(String label, String? sourceValue, List<dynamic> list) {
+    final isSelected = _selectedSource == sourceValue;
+    final count = sourceValue == null
+        ? list.length
+        : list.where((i) => i['source'] == sourceValue).length;
+    return ChoiceChip(
+      label: Text(
+        '$label ($count)',
+        style: TextStyle(
+          color: isSelected ? Colors.white : ink,
+          fontWeight: FontWeight.w700,
+          fontSize: 12,
+        ),
+      ),
+      selected: isSelected,
+      selectedColor: danger,
+      backgroundColor: bg,
+      checkmarkColor: Colors.white,
+      onSelected: (selected) {
+        setState(() {
+          _selectedSource = selected ? sourceValue : null;
+        });
+      },
+    );
+  }
+
+  Widget _tabButton(int index, String label) {
+    final isSelected = _selectedTab == index;
+    return Expanded(
+      child: GestureDetector(
+        onTap: () => setState(() => _selectedTab = index),
+        child: Container(
+          alignment: Alignment.center,
+          padding: const EdgeInsets.symmetric(vertical: 10),
+          decoration: BoxDecoration(
+            color: isSelected ? danger.withOpacity(0.08) : Colors.transparent,
+            borderRadius: BorderRadius.circular(20),
+            border: Border.all(
+              color: isSelected ? danger : const Color(0xFFD0D5DD),
+              width: 1.5,
+            ),
+          ),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontWeight: FontWeight.w800,
+              color: isSelected ? danger : muted,
+              fontSize: 14,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: simpleBar(
+        context,
+        title: 'Incident Alerts',
+        subtitle: 'Real-time alert tracking',
+        color: danger,
+      ),
+      body: RefreshIndicator(
+        onRefresh: _fetchIncidents,
+        child: LiveVehiclesBuilder(
+          builder: (context, liveVehicles, liveError, loadingLiveVehicles) {
+            final activeList =
+                _incidents.where((i) => i['status'] != 'resolved').toList();
+            final resolvedList =
+                _incidents.where((i) => i['status'] == 'resolved').toList();
+            final displayedList = _selectedTab == 0 ? activeList : resolvedList;
+            final filteredList = _selectedSource == null
+                ? displayedList
+                : displayedList.where((i) => i['source'] == _selectedSource).toList();
+
+            return Column(
+              children: [
+                Container(
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+                  color: Colors.white,
+                  child: Row(
+                    children: [
+                      _tabButton(0, 'Active (${activeList.length})'),
+                      const SizedBox(width: 12),
+                      _tabButton(1, 'Resolved (${resolvedList.length})'),
+                    ],
+                  ),
+                ),
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                  color: Colors.white,
+                  width: double.infinity,
+                  child: Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: [
+                      _sourceFilterChip('All', null, displayedList),
+                      _sourceFilterChip('Passenger', 'passenger_app', displayedList),
+                      _sourceFilterChip('Driver', 'driver_app', displayedList),
+                      _sourceFilterChip('Supervisor', 'supervisor_app', displayedList),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: _loading
+                      ? const Center(child: CircularProgressIndicator())
+                      : _error != null
+                          ? Center(
+                              child: Text(_error!,
+                                  style: const TextStyle(
+                                      color: muted,
+                                      fontWeight: FontWeight.w700)))
+                          : filteredList.isEmpty
+                              ? ListView(
+                                  physics:
+                                      const AlwaysScrollableScrollPhysics(),
+                                  children: [
+                                    SizedBox(
+                                        height:
+                                            MediaQuery.of(context).size.height *
+                                                0.25),
+                                    const Center(
+                                      child: Text(
+                                        'No incidents found',
+                                        style: TextStyle(
+                                            fontWeight: FontWeight.w700,
+                                            fontSize: 16,
+                                            color: muted),
+                                      ),
+                                    ),
+                                  ],
+                                )
+                              : ListView.builder(
+                                  physics:
+                                      const AlwaysScrollableScrollPhysics(),
+                                  itemCount: filteredList.length,
+                                  itemBuilder: (context, idx) {
+                                    final inc = filteredList[idx];
+                                    final category =
+                                        inc['category']?.toString() ?? 'Other';
+                                    final severity =
+                                        (inc['severity']?.toString() ??
+                                                'warning')
+                                            .toUpperCase();
+                                    final status =
+                                        inc['status']?.toString() ?? 'new';
+                                    final details =
+                                        inc['details']?.toString() ?? '';
+                                    final vehicleId =
+                                        inc['vehicle_id']?.toString() ?? 'N/A';
+                                    final routeId =
+                                        inc['route_id']?.toString() ?? 'N/A';
+                                    final transmitted =
+                                        inc['transmitted_to_control'] == true;
+
+                                    Color statusColor = Colors.orange;
+                                    if (status == 'resolved') {
+                                      statusColor = green;
+                                    } else if (status == 'investigating') {
+                                      statusColor = blue;
+                                    }
+
+                                    IconData alertIcon =
+                                        Icons.warning_amber_outlined;
+                                    Color alertColor = orange;
+                                    if (category
+                                            .toLowerCase()
+                                            .contains('accident') ||
+                                        category
+                                            .toLowerCase()
+                                            .contains('breakdown')) {
+                                      alertIcon = Icons.report_problem_outlined;
+                                    } else if (category
+                                        .toLowerCase()
+                                        .contains('delay')) {
+                                      alertIcon = Icons.schedule;
+                                    } else if (category
+                                        .toLowerCase()
+                                        .contains('crowding')) {
+                                      alertIcon = Icons.people_outline;
+                                    }
+
+                                    if (severity.toLowerCase() == 'critical') {
+                                      alertColor = danger;
+                                    } else if (severity.toLowerCase() ==
+                                        'minor') {
+                                      alertColor = blue;
+                                    }
+
+                                    return AppCard(
+                                      margin: const EdgeInsets.symmetric(
+                                          vertical: 6, horizontal: 14),
+                                      padding: const EdgeInsets.all(0),
+                                      child: InkWell(
+                                        borderRadius: BorderRadius.circular(12),
+                                        onTap: () {
+                                          _showIncidentDetailDialog(
+                                              context, inc, liveVehicles);
+                                        },
+                                        child: Padding(
+                                          padding: const EdgeInsets.all(16),
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Row(
+                                                children: [
+                                                  Icon(alertIcon,
+                                                      color: alertColor,
+                                                      size: 24),
+                                                  const SizedBox(width: 8),
+                                                  Expanded(
+                                                    child: Text(
+                                                      category,
+                                                      style: const TextStyle(
+                                                          fontWeight:
+                                                              FontWeight.w900,
+                                                          fontSize: 16),
+                                                    ),
+                                                  ),
+                                                  Container(
+                                                    padding: const EdgeInsets
+                                                        .symmetric(
+                                                        horizontal: 8,
+                                                        vertical: 4),
+                                                    decoration: BoxDecoration(
+                                                      color: statusColor
+                                                          .withOpacity(0.1),
+                                                      borderRadius:
+                                                          BorderRadius.circular(
+                                                              12),
+                                                    ),
+                                                    child: Text(
+                                                      status.toUpperCase(),
+                                                      style: TextStyle(
+                                                        fontWeight:
+                                                            FontWeight.w800,
+                                                        color: statusColor,
+                                                        fontSize: 11,
+                                                      ),
+                                                    ),
+                                                  ),
+                                                ],
+                                              ),
+                                              const SizedBox(height: 8),
+                                              Text(
+                                                details,
+                                                maxLines: 2,
+                                                overflow: TextOverflow.ellipsis,
+                                                style: const TextStyle(
+                                                    fontWeight: FontWeight.w600,
+                                                    fontSize: 14,
+                                                    color: Color(0xFF1E293B)),
+                                              ),
+                                              const SizedBox(height: 12),
+                                              Row(
+                                                mainAxisAlignment:
+                                                    MainAxisAlignment
+                                                        .spaceBetween,
+                                                children: [
+                                                  Text(
+                                                      'Vehicle: $vehicleId  |  Route: $routeId',
+                                                      style: const TextStyle(
+                                                          fontWeight:
+                                                              FontWeight.w700,
+                                                          fontSize: 12,
+                                                          color: muted)),
+                                                  if (transmitted)
+                                                    const Text(
+                                                        'Transmitted to CC',
+                                                        style: TextStyle(
+                                                            fontWeight:
+                                                                FontWeight.w800,
+                                                            fontSize: 11,
+                                                            color: green)),
+                                                ],
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
+                                    );
+                                  },
+                                ),
+                ),
+              ],
+            );
+          },
+        ),
+      ),
     );
   }
 }

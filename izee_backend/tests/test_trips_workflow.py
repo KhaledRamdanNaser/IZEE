@@ -451,6 +451,168 @@ def run_tests():
     
     print("TEST L Passed.")
 
+    # --- TEST M: Incident Reporting, isolation, transmission & replacement vehicle ---
+    print("\nTEST M: Incident reporting, isolation, transmission & replacement vehicle...")
+    
+    # 1. Create a scheduled assignment for BUS_001
+    today_date = datetime.date.today().isoformat()
+    status, asg = make_request("/supervisor/supervisor_2/assignments", "POST", {
+        "region_id": "zone_north",
+        "driver_id": "driver_test_001",
+        "vehicle_id": "BUS_001",
+        "route_id": "Route 8",
+        "service_date": today_date,
+        "planned_start_time": "12:00:00",
+        "planned_end_time": "14:00:00"
+    })
+    assert status in (200, 201), f"Failed to create scheduled assignment: {asg}"
+    asg_id = asg["assignment_id"]
+
+    # Start driver assignment so it is ACTIVE (required for location reports)
+    status, start_res = make_request(f"/driver/assignments/{asg_id}/start", "POST")
+    assert status == 200, f"Failed to start assignment: {start_res}"
+    
+    # 2. Report breakdown incident for BUS_001
+    status, inc = make_request("/incidents", "POST", {
+        "category": "Vehicle Breakdown",
+        "severity": "critical",
+        "status": "new",
+        "vehicle_id": "BUS_001",
+        "route_id": "Route 8",
+        "driver_name": "driver_test_001",
+        "lat": 30.0444,
+        "lon": 31.2357,
+        "location_label": "Nasr City",
+        "details": "Engine smoke, need backup vehicle.",
+        "source": "passenger_app"
+    })
+    assert status in (200, 201), f"Failed to report incident: {inc}"
+    inc_id = inc["incident_id"]
+    
+    # 3. Verify it is visible to Supervisor but NOT Control Center
+    status, sup_incidents = make_request("/incidents?scope=supervisor")
+    assert status == 200
+    assert any(i["incident_id"] == inc_id for i in sup_incidents["incidents"]), "Incident should be visible to supervisor"
+    
+    status, cc_incidents = make_request("/incidents?scope=control_center")
+    assert status == 200
+    assert not any(i["incident_id"] == inc_id for i in cc_incidents["incidents"]), "Incident should NOT be visible to control center before transmission"
+    
+    # 4. Supervisor takes action: resolves breakdown, deploys replacement vehicle BUS_002, transmits to CC
+    status, action_res = make_request(f"/incidents/{inc_id}/action", "POST", {
+        "status": "resolved",
+        "transmitted_to_control": True,
+        "replacement_vehicle_id": "BUS_002"
+    })
+    assert status == 200, f"Failed to update incident action: {action_res}"
+    
+    # 5. Verify the assignment's vehicle was updated to BUS_002
+    status, duties = make_request("/driver/driver_test_001/duties")
+    assert status == 200
+    asg_entry = next((d for d in duties["assigned_trips"] if d["assignment_id"] == asg_id), None)
+    assert asg_entry is not None, "Driver assignment should still exist"
+    assert asg_entry["vehicle_id"] == "BUS_002", f"Expected vehicle to be updated to BUS_002, got {asg_entry['vehicle_id']}"
+    
+    # 7. Create a delay incident to test the supervisor action and speed monitoring
+    status, delay_inc = make_request("/incidents", "POST", {
+        "category": "Delay",
+        "severity": "warning",
+        "status": "new",
+        "vehicle_id": "BUS_002",
+        "route_id": "Route 8",
+        "details": "Passenger reporting delay due to traffic",
+        "source": "passenger_app"
+    })
+    assert status == 200
+    delay_inc_id = delay_inc["incident_id"]
+
+    # Retrieve live state to verify speed before action
+    status, loc_res = make_request("/driver/location", "POST", {
+        "assignment_id": asg_id,
+        "driver_id": "driver_test_001",
+        "vehicle_id": "BUS_002",
+        "lat": 30.05,
+        "lon": 31.25,
+        "speed": 10.0,
+        "bearing": 90.0,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+    })
+    assert status == 200
+
+    # Supervisor triggers Speed Up Driver action
+    status, action_res = make_request(f"/incidents/{delay_inc_id}/action", "POST", {
+        "speed_up": True
+    })
+    assert status == 200, f"Failed to trigger Speed Up Driver action: {action_res}"
+
+    # Verify a ControlMessage was created for the driver
+    status, messages = make_request("/messages")
+    assert status == 200
+    driver_msgs = [m for m in messages["messages"] if m["recipient_type"] == "driver" and m["recipient_id"] == "driver_test_001"]
+    assert len(driver_msgs) > 0, "ControlMessage to speed up should be sent to the driver"
+    assert "reported as delayed" in driver_msgs[0]["body"]
+
+    # Driver sends next location update with same speed (no acceleration)
+    status, loc_res_no_accel = make_request("/driver/location", "POST", {
+        "assignment_id": asg_id,
+        "driver_id": "driver_test_001",
+        "vehicle_id": "BUS_002",
+        "lat": 30.06,
+        "lon": 31.26,
+        "speed": 10.0,
+        "bearing": 90.0,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
+    })
+    assert status == 200
+
+    # Verify incident was transmitted to Control Center automatically
+    status, cc_incidents_chk = make_request("/incidents?scope=control_center")
+    assert status == 200
+    assert any(i["incident_id"] == delay_inc_id for i in cc_incidents_chk["incidents"]), "Incident should be transmitted to CC when no acceleration happens"
+
+    # Verify Control Center and Supervisor messages were created
+    status, messages_after = make_request("/messages")
+    assert status == 200
+    cc_alert_msgs = [m for m in messages_after["messages"] if m["recipient_type"] == "control_center"]
+    assert len(cc_alert_msgs) > 0, "Alert message to CC should be sent"
+    assert "did not accelerate" in cc_alert_msgs[0]["body"]
+
+    sv_alert_msgs = [m for m in messages_after["messages"] if m["recipient_type"] == "supervisor"]
+    assert len(sv_alert_msgs) > 0, "Alert message to supervisor should be sent"
+    assert sv_alert_msgs[0]["recipient_id"] == "supervisor_2"
+
+    print("TEST M Passed.")
+
+    # --- TEST N: Service Checks ---
+    print("\nTEST N: Service Checks...")
+    status, svc_res = make_request("/service-checks", "POST", {
+        "vehicle_id": "BUS_002",
+        "rating": 4,
+        "checks": {
+            "Vehicle Cleanliness": True,
+            "Driver Behavior": True
+        },
+        "notes": "Good clean ride",
+        "recommend_driver_training": False,
+        "recommend_vehicle_maintenance": False,
+        "commend_excellent_service": True,
+        "source": "supervisor_app"
+    })
+    assert status == 201, f"Failed to create service check: {svc_res}"
+    svc_id = svc_res["incident_id"]
+    assert svc_id is not None
+
+    status, list_res = make_request("/service-checks")
+    assert status == 200
+    assert any(c["incident_id"] == svc_id for c in list_res["service_checks"]), "Service check should be in service-checks list"
+    
+    # Verify it maps correct route_id from the active assignment (BUS_002 is assigned to Route 8)
+    matched_svc = next(c for c in list_res["service_checks"] if c["incident_id"] == svc_id)
+    assert matched_svc["route_id"] == "Route 8", f"Expected Route 8, got {matched_svc['route_id']}"
+    assert matched_svc["raw_payload"]["rating"] == 4
+    assert matched_svc["raw_payload"]["checks"]["Vehicle Cleanliness"] is True
+    print("TEST N Passed.")
+
     print("\nALL WORKFLOW API TESTS PASSED SUCCESSFULLY!")
     cleanup_database()
 

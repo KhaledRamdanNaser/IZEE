@@ -11,8 +11,15 @@ import models.vehicle_live_state
 import models.transit_event
 import models.transit_observation
 import models.trips_workflow
-print(Base.metadata.tables)
-print("Registered tables:", Base.metadata.tables.keys())
-Base.metadata.create_all(bind=engine)
+import models.transit_incident
+import models.walking_transfer
+from sqlalchemy import text
 
+print("Registered tables:", Base.metadata.tables.keys())
+print("Dropping existing transit_incidents table to recreate with new column...")
+with engine.connect() as conn:
+    conn.execute(text("DROP TABLE IF EXISTS transit_incidents CASCADE;"))
+    conn.commit()
+
+Base.metadata.create_all(bind=engine)
 print("Tables created successfully")
