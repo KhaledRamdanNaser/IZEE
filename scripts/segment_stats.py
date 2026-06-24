@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database.connection import SessionLocal
 from models.segment_statistics import SegmentStatistics
+from datetime import datetime
 
 # --- KHALED EDIT START ---
 DAY_TYPE_MAP = {
@@ -35,6 +36,25 @@ DAY_TYPE_MAP = {
     "Sunday": "weekday",
     "Friday": "friday",
     "Saturday": "saturday",
+}
+def derive_time_period(dt):
+    if dt is None:
+        return "off_peak"
+
+    hour = dt.hour
+
+    if 6 <= hour < 10 or 15 <= hour < 19:
+        return "peak"
+
+    return "off_peak"
+DAY_NAMES = {
+    0: "Monday",
+    1: "Tuesday",
+    2: "Wednesday",
+    3: "Thursday",
+    4: "Friday",
+    5: "Saturday",
+    6: "Sunday"
 }
 
 MIN_SAMPLES = 30
@@ -226,11 +246,10 @@ SEGMENT_MERGE_MAP = {
     },
     # P_O_14_IG066 direction 1
     ("P_O_14_IG066", 1): {
-        "2484_2807": "2484_2118",
-        "2807_2325": "2484_2118",
-        "2325_2118": "2484_2118",
-        "2118_2250": "2118_2248",
-        "2250_2248": "2118_2248",
+      "2580_2484": "2484_2118",
+    "2484_2807": "2484_2118",
+    "2807_2325": "2484_2118",
+    "2325_2118": "2484_2118",
     },
     # CTA_80 direction 0
     ("CTA_80", 0): {
@@ -249,7 +268,16 @@ SEGMENT_MERGE_MAP = {
     # --- KHALED EDIT END ---
 }
 # --- KHALED EDIT END ---
+def derive_time_period(dt):
+    if dt is None:
+        return "off_peak"
 
+    hour = dt.hour
+
+    if 6 <= hour < 10 or 15 <= hour < 19:
+        return "peak"
+
+    return "off_peak"
 
 def fetch_segment_completed_rows(db):
     """
@@ -263,8 +291,7 @@ def fetch_segment_completed_rows(db):
             segment_id,
             route_id,
             direction,
-            day_of_week,
-            time_period,
+            timestamp,
             (metrics->>'travel_time')::float AS travel_time
         FROM transit_events
         WHERE event_type = 'segment_completed'
@@ -287,9 +314,17 @@ def build_groups(rows):
     skipped_unknown_day_type = 0
 
     for row in rows:
-        segment_id, route_id, direction, day_of_week, time_period, travel_time = row
+        segment_id, route_id, direction, timestamp, travel_time = row
 
-        day_type = DAY_TYPE_MAP.get(day_of_week)
+        # Convert DB timestamp string to datetime if needed
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+
+        day_name = DAY_NAMES[timestamp.weekday()]
+
+        day_type = DAY_TYPE_MAP.get(day_name)
+
+        time_period = derive_time_period(timestamp)
         if day_type is None:
             skipped_unknown_day_type += 1
             continue
