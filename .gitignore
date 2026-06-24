@@ -4,3 +4,14 @@ __pycache__/
 *.pyc
 **/data_salah/**
 *.jsonl
+
+# Ignore python virtual environments
+venv/
+.venv/
+env/
+
+# Ignore massive raw and engineered data files
+scripts/feature_data/*.csv
+
+# Ignore local compiled model binaries
+scripts/*.pkl
